@@ -27,7 +27,7 @@ from . import texts
 from .config import Config
 from .db import Database
 from .llm import create_client
-from .llm.probe import ProbeError, probe_key
+from .llm.probe import ProbeError, probe_key, verify_model
 from .persona import DEFAULT_BASE_PROMPT, generate_style_profile
 from .userbot import Userbot
 
@@ -308,6 +308,25 @@ class ControlBot:
                 await cb.answer()
                 return
             data = await state.get_data()
+            wait = await cb.message.answer(  # type: ignore[union-attr]
+                texts.MODEL_VERIFYING.format(model=chosen),
+            )
+            try:
+                await verify_model(data["provider"], data.get("base_url", ""), data["api_key"], chosen)
+            except ProbeError as exc:
+                await wait.delete()
+                await cb.answer()
+                await cb.message.answer(str(exc))  # type: ignore[union-attr]
+                return
+            except Exception:
+                logger.exception("verify_model мережева помилка")
+                await wait.delete()
+                await cb.answer()
+                await cb.message.answer(  # type: ignore[union-attr]
+                    "⚠️ Не вдалося зв'язатися з провайдером для перевірки моделі. Спробуйте ще раз.",
+                )
+                return
+            await wait.delete()
             key_id = await self._db.add_llm_key(
                 user_id=cb.from_user.id,
                 provider=data["provider"],
@@ -335,6 +354,21 @@ class ControlBot:
                 await message.answer("⚠️ Назва моделі не може бути порожньою.")
                 return
             data = await state.get_data()
+            wait = await message.answer(texts.MODEL_VERIFYING.format(model=model))
+            try:
+                await verify_model(data["provider"], data.get("base_url", ""), data["api_key"], model)
+            except ProbeError as exc:
+                await wait.delete()
+                await message.answer(str(exc))
+                return  # лишаємося в стані model — можна ввести іншу назву
+            except Exception:
+                logger.exception("verify_model мережева помилка")
+                await wait.delete()
+                await message.answer(
+                    "⚠️ Не вдалося зв'язатися з провайдером для перевірки моделі. Спробуйте ще раз.",
+                )
+                return
+            await wait.delete()
             key_id = await self._db.add_llm_key(
                 user_id=message.from_user.id,
                 provider=data["provider"],

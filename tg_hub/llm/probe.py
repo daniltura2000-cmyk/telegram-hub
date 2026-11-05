@@ -92,3 +92,69 @@ async def probe_key(provider: str, base_url: str, api_key: str) -> list[str]:
     if provider == "anthropic":
         return await _probe_anthropic(api_key)
     raise ProbeError(f"❌ Невідомий провайдер: {provider}")
+
+
+# ---------------------------------------------------------------------------
+# Жива перевірка моделі: провайдер може показувати модель у списку, але
+# відмовляти у виклику (preview-моделі, окремий доступ, квоти). Тому перед
+# збереженням робимо мінімальний реальний виклик.
+
+
+def _model_http_error(status: int, model: str) -> str:
+    if status == 404:
+        return f"❌ Модель «{model}» не існує або недоступна для вашого ключа (HTTP 404)."
+    if status == 403:
+        return (
+            f"❌ Немає доступу до «{model}» (HTTP 403). Модель у списку, але вимагає "
+            f"окремого доступу/підписки — оберіть іншу."
+        )
+    if status == 429:
+        return (
+            f"❌ «{model}» відповіла 429 — квота саме цієї моделі вичерпана. "
+            f"Оберіть іншу модель або спробуйте пізніше."
+        )
+    return f"❌ Провайдер відхилив модель «{model}» (HTTP {status}). Оберіть іншу."
+
+
+async def verify_model(provider: str, base_url: str, api_key: str, model: str) -> None:
+    """Мінімальний реальний виклик моделі; кидає ProbeError, якщо вона не працює."""
+    if provider == "openai":
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload, timeout=PROBE_TIMEOUT)
+        if response.status_code != 200:
+            raise ProbeError(_model_http_error(response.status_code, model))
+        return
+    if provider == "google":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        params = {"key": api_key}
+        payload = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                url, params=params, json=payload, timeout=PROBE_TIMEOUT,
+            )
+        if response.status_code != 200:
+            raise ProbeError(_model_http_error(response.status_code, model))
+        return
+    if provider == "anthropic":
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                   "content-type": "application/json"}
+        payload = {
+            "model": model, "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers, json=payload, timeout=PROBE_TIMEOUT,
+            )
+        if response.status_code != 200:
+            raise ProbeError(_model_http_error(response.status_code, model))
+        return
+    raise ProbeError(f"❌ Невідомий провайдер: {provider}")
