@@ -127,24 +127,24 @@ def test_client_validates_args():
 
 def test_format_context_labels_and_limits():
     pairs = [
-        (True, "Моє старе"),
-        (False, "Привіт"),
-        (True, "Привіт-привіт"),
-        (False, ""),
-        (True, "   "),
-        (False, "Як справи?"),
+        (True, "Моє старе", None),
+        (False, "Привіт", "10:05"),
+        (True, "Привіт-привіт", "10:06"),
+        (False, "", None),
+        (True, "   ", None),
+        (False, "Як справи?", "10:07"),
     ]
     text = format_context(pairs, max_messages=20)
     lines = text.splitlines()
     assert lines == [
         "Я: Моє старе",
-        "Співрозмовник: Привіт",
-        "Я: Привіт-привіт",
-        "Співрозмовник: Як справи?",
+        "[10:05] Співрозмовник: Привіт",
+        "[10:06] Я: Привіт-привіт",
+        "[10:07] Співрозмовник: Як справи?",
     ]
 
     short = format_context(pairs, max_messages=2)
-    assert short.splitlines() == ["Я: Привіт-привіт", "Співрозмовник: Як справи?"]
+    assert short.splitlines() == ["[10:06] Я: Привіт-привіт", "[10:07] Співрозмовник: Як справи?"]
 
 
 def test_strip_markdown_and_disclaimers():
@@ -159,6 +159,28 @@ def test_strip_markdown_and_disclaimers():
     with_disclaimer = "Я — штучний інтелект, тому...\nОсь моя відповідь."
     assert strip_markdown_artifacts(with_disclaimer) == "Ось моя відповідь."
     assert strip_markdown_artifacts("As an AI language model I cannot.") == ""
+
+
+def test_strip_ai_tells_and_em_dashes():
+    from tg_hub.userbot import strip_ai_tells
+
+    # довге тире — головна «палева» ШІ
+    assert strip_ai_tells("Привіт — як справи?") == "Привіт ... як справи?"
+    assert "—" not in strip_ai_tells("раз — два")
+    # assistant-стартери зникають
+    cleaned = strip_ai_tells("Сподіваюсь, це допомогло! Давай розберемо деталі.")
+    assert "Сподіваюсь" not in cleaned
+    assert "Давай розберемо" not in cleaned
+    # звичайний текст не пошкоджується
+    assert strip_ai_tells("ок, надішлю пізніше") == "ок, надішлю пізніше"
+
+
+def test_burst_reply_threshold_constant():
+    from tg_hub import userbot
+
+    assert userbot.BURST_REPLY_THRESHOLD == 3
+    assert userbot.DEBOUNCE_SECONDS == 2.0
+    assert userbot.MAX_BURST_WAIT == 30.0
 
 
 def test_split_reply_chunks():

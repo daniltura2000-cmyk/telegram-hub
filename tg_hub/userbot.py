@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 from telethon import TelegramClient, events
@@ -33,6 +34,22 @@ _MD_ARTIFACTS = (
     ("###", ""),
     ("##", ""),
 )
+# Фрази, якими «палиться» ШІ: канцелярит, assistant-стартери, звернення-прощання.
+_AI_TELLS_PATTERNS = (
+    re.compile(r"^\s*(Сподіва(ємся|юсь|юся)[^\n.!?\n]*[.!?\n]?\s*|"
+               r"(Радий|Готовий|Рада|Готова) (допомогти|відповісти)[^\n.!?\n]*[.!?\n]?\s*|"
+               r"(Гарне|Чудове) запитання[.!]?\s*|"
+               r"Звісно[,!.]?\s*|Звичайно[,!.]?\s*|"
+               r"Дава(й|йте) роз(бер|глянем|беремо|глядемо)[^\n.!?\n]*[.!?\n]?\s*|"
+               r"(Резюмуючи|Підсумовуючи)[^\n.:!?\n]*[:.]?\s*|"
+               r"Отже[,;.]\s*|Висновок[:.]?\s*|У висновку[,:]?\s*)", re.IGNORECASE),
+    re.compile(r"\b(резюмуючи|підсумовуючи)\b[^\n.:!?]*[:.]?\s*", re.IGNORECASE),
+    re.compile(r"\b(як штучний інтелект|як ШІ|як мовна модель|як асистент)\b", re.IGNORECASE),
+    re.compile(r"\s*\b(не соромтеся звертатись|не соромся звертатись|звертайтеся якщо|"
+               r"звертайся якщо|якщо будуть питання|якщо виникнуть питання)[^\n]*", re.IGNORECASE),
+)
+# Довге тире « — » у телеграм-балачці видає ШІ: живі люди майже не пишуть ем-дефіси.
+_EM_DASH_RE = re.compile(r"\s*[—–]\s*")
 TYPING_CHARS_PER_SECOND = 15.0
 TYPING_MIN_SECONDS = 1.0
 TYPING_MAX_SECONDS = 6.0
@@ -42,6 +59,7 @@ ERROR_NOTIFY_INTERVAL = 600.0  # не спамити адміна частіше
 DEBOUNCE_SECONDS = 2.0      # скільки чекати тиші перед відповіддю
 TYPING_GRACE = 2.5          # скільки рахувати «ще друкує» після останьої дії
 MAX_BURST_WAIT = 30.0       # стеля очікування, щоб не зависати назавжди
+BURST_REPLY_THRESHOLD = 3   # ≥3 повідомлень — контекст зрозумілий, відповідаємо раніше
 
 MEDIA_PLACEHOLDERS: tuple[tuple[str, str], ...] = (
     ("sticker", "[стикер]"),
@@ -64,11 +82,30 @@ def media_placeholder(message: Any) -> str | None:
     return "[медіа]"
 
 
+def strip_ai_tells(text: str) -> str:
+    """Прибрати «відкриття-помічника», канцелярит і штучні ем-дефіси."""
+    # старт-фрази можуть іти поспіль («Сподіваюсь,... Давай розберемо...»)
+    for _ in range(3):
+        new = _AI_TELLS_PATTERNS[0].sub("", text)
+        if new == text:
+            break
+        text = new
+    for pattern in _AI_TELLS_PATTERNS[1:]:
+        text = pattern.sub("", text)
+    # « — » → три крапки з пробілами; кінцеві пробіли прибирає нормалізація
+    text = _EM_DASH_RE.sub(" ... ", text)
+    # зайві пропуски після чисток
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip(" \t\n,;")
+
+
 def strip_markdown_artifacts(text: str) -> str:
-    """Прибрати markdown-артефакти та дислеймери про ШІ."""
+    """Прибрати markdown-артефакти, дислеймери про ШІ та «шІ-зманери»."""
     for old, new in _MD_ARTIFACTS:
         text = text.replace(old, new)
     text = _DISCLAIMER_RE.sub("", text)
+    text = strip_ai_tells(text)
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
 
@@ -102,13 +139,18 @@ def split_reply(text: str, max_chunks: int = 3) -> list[str]:
     return chunks[:max_chunks]
 
 
-def format_context(pairs: list[tuple[bool, str]], max_messages: int = 20) -> str:
-    """Історія → текст з мітками «Я:» / «Співрозмовник:» (хронологічно, останні N).
+def format_context(pairs: list[tuple[bool, str, str | None]], max_messages: int = 20) -> str:
+    """Історія → текст з мітками, часом і «Я:»/«Співрозмовник:» (хронологічно, останні N).
 
-    ``pairs`` — список (is_outgoing, text) у хронологічному порядку.
+    ``pairs`` — список (is_outgoing, text, time_label) у хронологічному порядку;
+    ``time_label`` — «HH:MM» або None. Час дає моделі опору: «я подзвоню за 5 хв»
+    має сенс тільки якщо відомо, котра зараз година.
     """
     recent = [p for p in pairs if p[1] and p[1].strip()][-max_messages:]
-    lines = [f"{OWNER_LABEL if out else OTHER_LABEL} {text.strip()}" for out, text in recent]
+    lines = []
+    for out, text, time_label in recent:
+        stamp = f"[{time_label}] " if time_label else ""
+        lines.append(f"{stamp}{OWNER_LABEL if out else OTHER_LABEL} {text.strip()}")
     return "\n".join(lines)
 
 
@@ -237,13 +279,20 @@ class Userbot:
             logger.exception("Помилка обробки UserUpdate")
 
     async def _debounced_reply(self, chat_id: int, user_id: int, settings: dict[str, Any]) -> None:
-        """Чекає тишу (і паузи «друкує»), потім ОДНА відповідь на весь burst."""
+        """Чекає тишу (і паузи «друкує»), потім ОДНА відповідь на весь burst.
+
+        Виняток: якщо накопичилось BURST_REPLY_THRESHOLD повідомлень — відповідаємо
+        одразу (з невеликою паузою), бо контекст уже достатній.
+        """
         try:
             deadline = time.monotonic() + MAX_BURST_WAIT
             while True:
                 await asyncio.sleep(DEBOUNCE_SECONDS)
                 now = time.monotonic()
                 if now >= deadline:
+                    break
+                # ≥3 повідомлень — контекст зрозумілий, не змушуємо чекати
+                if len(self._pending.get(chat_id, [])) >= BURST_REPLY_THRESHOLD:
                     break
                 # людина друкує? зачекаемо ще одне вікно
                 if now < self._typing_until.get(chat_id, 0.0):
@@ -338,11 +387,16 @@ class Userbot:
     async def _build_context(self, chat_ref: Any, limit: int) -> str:
         assert self.client is not None
         messages = await self.client.get_messages(chat_ref, limit=max(1, limit))
-        pairs: list[tuple[bool, str]] = []
+        pairs: list[tuple[bool, str, str | None]] = []
         for msg in reversed(messages):  # get_messages повертає від нових до старих
             text = (msg.message or "").strip() if msg.message else ""
             if text:
-                pairs.append((bool(msg.out), text))
+                time_label = None
+                try:
+                    time_label = msg.date.astimezone().strftime("%H:%M")
+                except Exception:  # noqa: BLE001 — без часу теж ок
+                    pass
+                pairs.append((bool(msg.out), text, time_label))
         return format_context(pairs, max_messages=limit)
 
     def _system_prompt(self, base_prompt: str, style_profile: str) -> str:
@@ -375,10 +429,12 @@ class Userbot:
                 f"\n\n{'=' * 12} {KB_SECTION_HEADER} {'=' * 12}\n{kb_text}\n{'=' * 12}"
             )
         latest = "\n".join(f"• {item}" for item in burst)
+        current_time = datetime.now().strftime("%H:%M")
         user_content = (
-            f"Історія діалогу:\n{context}\n\n"
+            f"Історія діалогу (у квадратних дужках — місцевий час):\n{context}\n\n"
+            f"Зараз: [{current_time}]\n\n"
             f"Щойно надійшло від співрозмовника (може бути кілька повідомлень підряд — "
-            f"прочитай їх як одне ціле і відповість на все разом):\n{latest}\n\n"
+            f"прочитай їх як одне ціле і відповіси на все разом):\n{latest}\n\n"
             "Напиши МОЮ відповідь (лише текст повідомлення, без лапок і пояснень). "
             "Одна відповідь на весь блок, не окремо на кожне повідомлення."
         )
