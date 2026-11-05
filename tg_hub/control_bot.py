@@ -661,23 +661,6 @@ class ControlBot:
             await state.clear()
             await self._send_autoreply_menu(message)
 
-        async def _send_autoreply_menu(message: Message) -> None:
-            await self._db.ensure_user(message.from_user.id)
-            s = await self._db.get_settings(message.from_user.id)
-            await message.answer(
-                texts.AUTOREPLY_MENU.format(summary="Оберіть параметр:"),
-                reply_markup=kb.autoreply_menu(
-                    auto_reply=bool(s["auto_reply"]),
-                    whitelist_mode=bool(s["whitelist_mode"]),
-                    only_mention=bool(s["only_private_or_mention"]),
-                    reply_delay_min=float(s["reply_delay_min"]),
-                    reply_delay_max=float(s["reply_delay_max"]),
-                    max_chunks=int(s["max_chunks"]),
-                    context_messages=int(s["context_messages"]),
-                    cooldown_seconds=int(s["cooldown_seconds"]),
-                ),
-            )
-
         @r.callback_query(F.data == "ar:toggle")
         @error_guard
         async def ar_toggle(cb: CallbackQuery) -> None:
@@ -970,6 +953,23 @@ class ControlBot:
                 pass
 
     # ------------------------------------------------------------------ допоміжне
+
+    async def _send_autoreply_menu(self, message: Message) -> None:
+        await self._db.ensure_user(message.from_user.id)
+        s = await self._db.get_settings(message.from_user.id)
+        await message.answer(
+            texts.AUTOREPLY_MENU.format(summary="Оберіть параметр:"),
+            reply_markup=kb.autoreply_menu(
+                auto_reply=bool(s["auto_reply"]),
+                whitelist_mode=bool(s["whitelist_mode"]),
+                only_mention=bool(s["only_private_or_mention"]),
+                reply_delay_min=float(s["reply_delay_min"]),
+                reply_delay_max=float(s["reply_delay_max"]),
+                max_chunks=int(s["max_chunks"]),
+                context_messages=int(s["context_messages"]),
+                cooldown_seconds=int(s["cooldown_seconds"]),
+            ),
+        )
 
     async def _finish_connect(self, message: Message, state: FSMContext,
                               client: TelegramClient | None = None) -> None:
