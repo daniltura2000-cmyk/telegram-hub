@@ -121,3 +121,80 @@ async def test_now_local_iso_sortable_with_parse_output():
     due = parse_reminder_time("через 30 хв")
     assert due is not None
     assert due.isoformat(timespec="seconds") > now_local_iso()
+
+
+# --------------------------------------------------- регресія: «через 0 …»
+
+@pytest.mark.parametrize("raw", ["через 0 хв", "через 0 год", "через 0 днів", "через 00 хвилин"])
+def test_parse_relative_zero_rejected(raw):
+    """«через 0 хв» — це зараз, а не майбутнє: парсер відхиляє."""
+    assert parse_reminder_time(raw, now=NOW) is None
+
+
+# --------------------------------------------------- регресія: цикл надсилання
+
+class _FakeReminderDb:
+    """Мінімальний двічі-сторонній підставник Database для reminder_loop."""
+
+    def __init__(self, items):
+        self._items = list(items)
+        self.done_ids: list[int] = []
+
+    async def list_due_reminders(self, now_iso: str):
+        return [i for i in self._items if i["id"] not in self.done_ids]
+
+    async def mark_reminder_done(self, reminder_id: int) -> bool:
+        self.done_ids.append(reminder_id)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_reminder_loop_sends_overdue_immediately_and_marks_done():
+    import asyncio
+
+    from tg_hub.reminders import reminder_loop
+    from tg_hub import texts
+
+    db = _FakeReminderDb([{"id": 1, "user_id": 42, "text": "полити квіти"}])
+    sent: list[tuple[int, str]] = []
+
+    async def send(user_id: int, text: str) -> None:
+        sent.append((user_id, text))
+
+    task = asyncio.create_task(reminder_loop(db, send, interval=0.05))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if db.done_ids:
+            break
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert sent == [(42, texts.REMINDER_TEXT.format(text="полити квіти"))]
+    assert db.done_ids == [1]
+
+
+@pytest.mark.asyncio
+async def test_reminder_loop_failed_send_is_not_marked_done():
+    import asyncio
+
+    from tg_hub.reminders import reminder_loop
+
+    db = _FakeReminderDb([{"id": 7, "user_id": 42, "text": "текст"}])
+    calls = {"n": 0}
+
+    async def failing_send(user_id: int, text: str) -> None:
+        calls["n"] += 1
+        raise RuntimeError("telegram down")
+
+    task = asyncio.create_task(reminder_loop(db, failing_send, interval=0.05))
+    await asyncio.sleep(0.17)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    # надсилання повторювалося, але нагадування НЕ позначено виконаним
+    assert calls["n"] >= 2
+    assert db.done_ids == []

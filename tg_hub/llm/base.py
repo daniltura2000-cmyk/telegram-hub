@@ -19,6 +19,19 @@ class LLMError(Exception):
     """Помилка виклику LLM (після вичерпання повторів тощо)."""
 
 
+def _parse_retry_after(response: Any) -> float | None:
+    """Retry-After у секундах (числовий формат) або None — дати/сміття ігноруємо."""
+    headers = getattr(response, "headers", None)
+    raw = headers.get("Retry-After") if headers is not None else None
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 class BaseLLMClient(abc.ABC):
     """Єдиний інтерфейс: ``await chat(messages, system) -> str``."""
 
@@ -48,7 +61,9 @@ class BaseLLMClient(abc.ABC):
                          headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         """POST з повторами та експоненційною затримкою на 429/5xx/таймаутах."""
         last_error = ""
+        retry_after: float | None = None
         for attempt in range(self.max_retries):
+            retry_after = None
             try:
                 response = await client.post(url, headers=headers, json=payload, timeout=self.timeout)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -58,6 +73,7 @@ class BaseLLMClient(abc.ABC):
                 if response.status_code in RETRYABLE_STATUS_CODES:
                     last_error = f"HTTP {response.status_code}"
                     logger.warning("LLM %s (спроба %d/%d): %s", url, attempt + 1, self.max_retries, last_error)
+                    retry_after = _parse_retry_after(response)
                 else:
                     if response.status_code >= 400:
                         raise LLMError(
@@ -66,7 +82,11 @@ class BaseLLMClient(abc.ABC):
                     return response.json()
 
             if attempt < self.max_retries - 1:
-                await asyncio.sleep(self.backoff_base * (2 ** attempt))
+                delay = self.backoff_base * (2 ** attempt)
+                if retry_after is not None:
+                    # поважаємо Retry-After провайдера (обмежуємо розумним діапазоном)
+                    delay = max(delay, min(retry_after, 60.0))
+                await asyncio.sleep(delay)
 
         if last_error.startswith("HTTP 429"):
             raise LLMError(

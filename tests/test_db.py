@@ -286,3 +286,21 @@ async def test_profiles_list_get_delete(db: Database):
     assert await db.delete_profile(1, first) is True
     assert await db.delete_profile(1, first) is False
     assert [p["id"] for p in await db.list_profiles(1)] == [second]
+
+
+@pytest.mark.asyncio
+async def test_qa_entry_texts_capped(db: Database):
+    """Гігантські тексти не потрапляють у журнал повністю (ліміт 2000 символів)."""
+    from tg_hub.db import QA_TEXT_MAX_CHARS
+
+    big_q = "п" * 10_000
+    big_a = "в" * 10_000
+    await db.add_qa_entry(1, "@chat", "Чат", big_q, big_a)
+    entry = (await db.list_qa_entries(1))[0]
+    assert len(entry["question"]) == QA_TEXT_MAX_CHARS
+    assert len(entry["answer"]) == QA_TEXT_MAX_CHARS
+
+    # короткі тексти не обрізаються
+    await db.add_qa_entry(1, "@chat", "Чат", "коротке", "коротка")
+    short = (await db.list_qa_entries(1))[0]
+    assert short["question"] == "коротке" and short["answer"] == "коротка"

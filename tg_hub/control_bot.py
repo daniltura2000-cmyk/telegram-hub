@@ -106,7 +106,40 @@ class AdminFilter(BaseFilter):
         return bool(user) and user.id in self.admin_ids  # type: ignore[union-attr]
 
 
+_MENU_TEXTS = frozenset({
+    texts.BTN_API_KEYS, texts.BTN_CONNECT, texts.BTN_PROMPT, texts.BTN_STYLE,
+    texts.BTN_AUTOREPLY, texts.BTN_STATUS, texts.BTN_REMINDERS, texts.BTN_PROFILES,
+    texts.BTN_BACK, texts.BTN_CANCEL,
+})
+
+
+class NotMenuText(BaseFilter):
+    """Не пропускає кнопки головного меню.
+
+    FSM-обробники «зловити все» не повинні з'їдати натискання кнопок меню:
+    інакше в стані (наприклад RemindStates.text) кнопка «⚙️ Налаштування»
+    зберігається як текст нагадування, а меню не відкривається.
+    """
+
+    async def __call__(self, message: Message) -> bool:
+        return message.text not in _MENU_TEXTS
+
+
 Handler = Callable[..., Awaitable[Any]]
+
+
+async def _notify_error(event: Message | CallbackQuery, text: str) -> None:
+    """Повідомити про помилку і зняти «годинник» завантаження на callback-кнопці."""
+    target = getattr(event, "message", None) or event
+    try:
+        await target.answer(text)  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        logger.exception("Не вдалося надіслати повідомлення про помилку")
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.answer()  # прибираємо спінер, якщо адмін ще чекає
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def error_guard(handler: Handler) -> Handler:
@@ -118,13 +151,10 @@ def error_guard(handler: Handler) -> Handler:
             return await handler(event, *args, **kwargs)
         except TelegramAPIError:
             logger.exception("Помилка Telegram API в обробнику %s", handler.__name__)
+            await _notify_error(event, texts.ERR_GENERIC)
         except Exception:  # noqa: BLE001 — головний захист від падіння процесу
             logger.exception("Помилка в обробнику %s", handler.__name__)
-            target = getattr(event, "message", None) or event
-            try:
-                await target.answer(texts.ERR_GENERIC)  # type: ignore[union-attr]
-            except Exception:  # noqa: BLE001
-                logger.exception("Не вдалося надіслати повідомлення про помилку")
+            await _notify_error(event, texts.ERR_GENERIC)
 
     return wrapper
 
@@ -156,6 +186,23 @@ class ControlBot:
         keys = await self._db.list_llm_keys(user_id)
         if all(not k["is_active"] for k in keys):
             await self._db.set_active_key(user_id, key_id)
+
+    @staticmethod
+    async def _safe_edit(message: Message, text: str,
+                         reply_markup: InlineKeyboardMarkup | None = None) -> None:
+        """edit_text із fallback: повідомлення старше 48 год уже не редагується."""
+        try:
+            await message.edit_text(text, reply_markup=reply_markup)
+        except TelegramAPIError:
+            await message.answer(text, reply_markup=reply_markup)
+
+    @staticmethod
+    async def _safe_edit_markup(message: Message, reply_markup: InlineKeyboardMarkup) -> None:
+        """Оновити клавіатуру; для повідомлень старше 48 год — тихо пропустити."""
+        try:
+            await message.edit_reply_markup(reply_markup=reply_markup)
+        except TelegramAPIError:
+            logger.debug("Не вдалося оновити клавіатуру повідомлення", exc_info=True)
 
     async def _require_userbot(self, event: Message | CallbackQuery) -> bool:
         if not self._userbot.connected:
@@ -216,7 +263,8 @@ class ControlBot:
 
         @r.message(F.text == texts.BTN_STATUS)
         @error_guard
-        async def status(message: Message) -> None:
+        async def status(message: Message, state: FSMContext) -> None:
+            await state.clear()  # інакше FSM «застрягне»: наступний текст піде в активний діалог
             user_id = message.from_user.id
             account = await self._db.get_account(user_id)
             keys = await self._db.list_llm_keys(user_id)
@@ -252,7 +300,7 @@ class ControlBot:
         @r.callback_query(F.data == "key:add")
         @error_guard
         async def key_add(cb: CallbackQuery, state: FSMContext) -> None:
-            await cb.message.edit_text(texts.CHOOSE_PROVIDER, reply_markup=kb.provider_choice())  # type: ignore[union-attr]
+            await self._safe_edit(cb.message, texts.CHOOSE_PROVIDER, kb.provider_choice())  # type: ignore[arg-type]
             await cb.answer()
 
         @r.callback_query(F.data.startswith("keyprov:"))
@@ -265,16 +313,16 @@ class ControlBot:
                 # пресет: base_url вже відомий → одразу ключ
                 await state.update_data(base_url=parts[2].rstrip("/"))
                 await state.set_state(ApiKeyStates.api_key)
-                await cb.message.edit_text(texts.ASK_API_KEY)  # type: ignore[union-attr]
+                await self._safe_edit(cb.message, texts.ASK_API_KEY)  # type: ignore[arg-type]
             elif provider == "openai":
                 await state.set_state(ApiKeyStates.base_url)
-                await cb.message.edit_text(texts.ASK_BASE_URL)  # type: ignore[union-attr]
+                await self._safe_edit(cb.message, texts.ASK_BASE_URL)  # type: ignore[arg-type]
             else:
                 await state.set_state(ApiKeyStates.api_key)
-                await cb.message.edit_text(texts.ASK_API_KEY)  # type: ignore[union-attr]
+                await self._safe_edit(cb.message, texts.ASK_API_KEY)  # type: ignore[arg-type]
             await cb.answer()
 
-        @r.message(ApiKeyStates.base_url)
+        @r.message(NotMenuText(), ApiKeyStates.base_url)
         @error_guard
         async def key_base_url(message: Message, state: FSMContext) -> None:
             url = (message.text or "").strip().rstrip("/")
@@ -290,7 +338,7 @@ class ControlBot:
             await state.set_state(ApiKeyStates.api_key)
             await message.answer(texts.ASK_API_KEY)
 
-        @r.message(ApiKeyStates.api_key)
+        @r.message(NotMenuText(), ApiKeyStates.api_key)
         @error_guard
         async def key_api_key(message: Message, state: FSMContext) -> None:
             api_key = (message.text or "").strip()
@@ -335,7 +383,9 @@ class ControlBot:
                 texts.MODEL_VERIFYING.format(model=chosen),
             )
             try:
-                await verify_model(data["provider"], data.get("base_url", ""), data["api_key"], chosen)
+                warning = await verify_model(
+                    data["provider"], data.get("base_url", ""), data["api_key"], chosen
+                )
             except ProbeError as exc:
                 await wait.delete()
                 await cb.answer()
@@ -364,12 +414,13 @@ class ControlBot:
                 data["provider"], data["provider"]
             )
             await cb.message.answer(  # type: ignore[union-attr]
-                texts.KEY_ADDED_ACTIVE.format(key_id=key_id, provider=provider_name, model=chosen),
+                texts.KEY_ADDED_ACTIVE.format(key_id=key_id, provider=provider_name, model=chosen)
+                + (f"\n\n{warning}" if warning else ""),
                 reply_markup=kb.main_menu(),
             )
             await cb.answer()
 
-        @r.message(ApiKeyStates.model)
+        @r.message(NotMenuText(), ApiKeyStates.model)
         @error_guard
         async def key_model(message: Message, state: FSMContext) -> None:
             model = (message.text or "").strip()
@@ -379,7 +430,9 @@ class ControlBot:
             data = await state.get_data()
             wait = await message.answer(texts.MODEL_VERIFYING.format(model=model))
             try:
-                await verify_model(data["provider"], data.get("base_url", ""), data["api_key"], model)
+                warning = await verify_model(
+                    data["provider"], data.get("base_url", ""), data["api_key"], model
+                )
             except ProbeError as exc:
                 await wait.delete()
                 await message.answer(str(exc))
@@ -406,7 +459,8 @@ class ControlBot:
                 data["provider"], data["provider"]
             )
             await message.answer(
-                texts.KEY_ADDED_ACTIVE.format(key_id=key_id, provider=provider_name, model=model),
+                texts.KEY_ADDED_ACTIVE.format(key_id=key_id, provider=provider_name, model=model)
+                + (f"\n\n{warning}" if warning else ""),
                 reply_markup=kb.main_menu(),
             )
 
@@ -415,7 +469,7 @@ class ControlBot:
         async def key_list_cb(cb: CallbackQuery) -> None:
             keys = await self._db.list_llm_keys(cb.from_user.id)
             if not keys:
-                await cb.message.edit_text(texts.KEY_LIST_EMPTY, reply_markup=kb.api_keys_menu())  # type: ignore[union-attr]
+                await self._safe_edit(cb.message, texts.KEY_LIST_EMPTY, kb.api_keys_menu())  # type: ignore[arg-type]
             else:
                 listing = "\n".join(
                     texts.KEY_LABEL_FMT.format(
@@ -425,9 +479,10 @@ class ControlBot:
                     )
                     for k in keys
                 )
-                await cb.message.edit_text(  # type: ignore[union-attr]
+                await self._safe_edit(  # type: ignore[arg-type]
+                    cb.message,
                     f"📋 <b>Ключі</b> (⭐ = активний):\n{listing}",
-                    reply_markup=kb.key_list(keys),
+                    kb.key_list(keys),
                 )
             await cb.answer()
 
@@ -440,7 +495,7 @@ class ControlBot:
             else:
                 await cb.answer("Ключ не знайдено", show_alert=True)
             keys = await self._db.list_llm_keys(cb.from_user.id)
-            await cb.message.edit_reply_markup(reply_markup=kb.key_list(keys))  # type: ignore[union-attr]
+            await self._safe_edit_markup(cb.message, kb.key_list(keys))  # type: ignore[arg-type]
 
         @r.callback_query(F.data.startswith("key:delete:"))
         @error_guard
@@ -449,7 +504,7 @@ class ControlBot:
             await self._db.delete_llm_key(cb.from_user.id, key_id)
             await cb.answer(texts.KEY_DELETED.format(key_id=key_id), show_alert=True)
             keys = await self._db.list_llm_keys(cb.from_user.id)
-            await cb.message.edit_reply_markup(reply_markup=kb.key_list(keys))  # type: ignore[union-attr]
+            await self._safe_edit_markup(cb.message, kb.key_list(keys))  # type: ignore[arg-type]
 
         # ------------------------------------------------------ підключення акаунта
 
@@ -533,6 +588,11 @@ class ControlBot:
                     f"Спробуйте ще раз через {exc.seconds // 60 + 1} хв.",
                 )
                 return
+            except Exception:
+                # неочікувана помилка: не залишаємо «вічно живий» клієнт і не тримаємо FSM
+                await client.disconnect()
+                await state.clear()
+                raise
             self._pending_clients[user_id] = client
             await state.update_data(phone=phone)
             await state.set_state(ConnectStates.code)
@@ -658,7 +718,7 @@ class ControlBot:
             await self._db.set_base_prompt(cb.from_user.id, DEFAULT_BASE_PROMPT)
             await cb.answer(texts.PROMPT_RESET_DONE, show_alert=True)
 
-        @r.message(PromptStates.editing)
+        @r.message(NotMenuText(), PromptStates.editing)
         @error_guard
         async def prompt_save(message: Message, state: FSMContext) -> None:
             text = (message.text or "").strip()
@@ -689,10 +749,12 @@ class ControlBot:
                 await cb.answer()
                 return
             if cb.data == "style:one":
-                await cb.message.edit_text(texts.SELECT_ONE_CHAT, reply_markup=kb.dialogs_one(dialogs))  # type: ignore[union-attr]
+                await self._safe_edit(cb.message, texts.SELECT_ONE_CHAT, kb.dialogs_one(dialogs))  # type: ignore[arg-type]
             else:
                 await state.update_data(selected=set())
-                await cb.message.edit_text(texts.SELECT_MULTI_CHAT, reply_markup=kb.dialogs_multi(dialogs, set()))  # type: ignore[union-attr]
+                await self._safe_edit(  # type: ignore[arg-type]
+                    cb.message, texts.SELECT_MULTI_CHAT, kb.dialogs_multi(dialogs, set()),
+                )
             await cb.answer()
 
         @r.callback_query(F.data == "style:clearmulti")
@@ -702,7 +764,9 @@ class ControlBot:
             data["selected"] = set()
             await state.set_data(data)
             dialogs = await self._list_dialogs()
-            await cb.message.edit_reply_markup(reply_markup=kb.dialogs_multi(dialogs, set()))  # type: ignore[union-attr]
+            await self._safe_edit_markup(  # type: ignore[arg-type]
+                cb.message, kb.dialogs_multi(dialogs, set())
+            )
             await cb.answer(texts.MULTI_SELECTED.format(count=0))
 
         @r.callback_query(F.data.startswith("style:toggle:"))
@@ -714,16 +778,18 @@ class ControlBot:
             selected.symmetric_difference_update({ref})
             await state.update_data(selected=selected)
             dialogs = await self._list_dialogs()
-            await cb.message.edit_reply_markup(reply_markup=kb.dialogs_multi(dialogs, selected))  # type: ignore[union-attr]
+            await self._safe_edit_markup(  # type: ignore[arg-type]
+                cb.message, kb.dialogs_multi(dialogs, selected)
+            )
             await cb.answer(texts.MULTI_SELECTED.format(count=len(selected)))
 
         @r.callback_query(F.data.startswith("style:pickone:"))
         @error_guard
         async def style_pick_one(cb: CallbackQuery) -> None:
             ref = cb.data.split(":", 2)[2]
+            await cb.answer()  # зняти спінер одразу: аналіз триває до хвилини
             await cb.message.answer(texts.ANALYSIS_STARTED.format(limit=self._config.analysis_limit))  # type: ignore[union-attr]
             await self._run_style_analysis(cb.from_user.id, [ref], cb.message)  # type: ignore[arg-type]
-            await cb.answer()
 
         @r.callback_query(F.data == "style:donemulti")
         @error_guard
@@ -734,9 +800,9 @@ class ControlBot:
                 await cb.answer("Нічого не обрано", show_alert=True)
                 return
             await state.clear()
+            await cb.answer()  # зняти спінер одразу: аналіз триває до хвилини
             await cb.message.answer(texts.ANALYSIS_STARTED.format(limit=self._config.analysis_limit))  # type: ignore[union-attr]
             await self._run_style_analysis(cb.from_user.id, selected, cb.message)  # type: ignore[arg-type]
-            await cb.answer()
 
         @r.callback_query(F.data == "style:all")
         @error_guard
@@ -750,9 +816,9 @@ class ControlBot:
                 await cb.answer()
                 return
             refs = [ref for _cid, _title, ref in dialogs]
+            await cb.answer()  # зняти спінер одразу: аналіз триває до хвилини
             await cb.message.answer(texts.ANALYSIS_STARTED.format(limit=self._config.analysis_limit))  # type: ignore[union-attr]
             await self._run_style_analysis(cb.from_user.id, refs, cb.message)  # type: ignore[arg-type]
-            await cb.answer()
 
         @r.callback_query(F.data.in_({"style:show", "style:regen"}))
         @error_guard
@@ -777,9 +843,9 @@ class ControlBot:
                 await cb.answer()
                 return
             refs = [item["chat_ref"] for item in analyzed]
+            await cb.answer()  # зняти спінер одразу: аналіз триває до хвилини
             await cb.message.answer(texts.ANALYSIS_STARTED.format(limit=self._config.analysis_limit))  # type: ignore[union-attr]
             await self._run_style_analysis(cb.from_user.id, refs, cb.message)  # type: ignore[arg-type]
-            await cb.answer()
 
         # ------------------------------------------------------ нагадування та журнал Q&A
 
@@ -803,7 +869,7 @@ class ControlBot:
             await cb.message.answer(texts.ASK_REMIND_TEXT)  # type: ignore[union-attr]
             await cb.answer()
 
-        @r.message(RemindStates.text)
+        @r.message(NotMenuText(), RemindStates.text)
         @error_guard
         async def remind_text_input(message: Message, state: FSMContext) -> None:
             text = (message.text or "").strip()
@@ -814,7 +880,7 @@ class ControlBot:
             await state.set_state(RemindStates.time)
             await message.answer(texts.ASK_REMIND_TIME)
 
-        @r.message(RemindStates.time)
+        @r.message(NotMenuText(), RemindStates.time)
         @error_guard
         async def remind_time_input(message: Message, state: FSMContext) -> None:
             raw = (message.text or "").strip()
@@ -881,7 +947,7 @@ class ControlBot:
                 reply_markup=kb.main_menu(),
             )
 
-        @r.message(KbStates.content)
+        @r.message(NotMenuText(), KbStates.content)
         @error_guard
         async def kb_chunk(message: Message, state: FSMContext) -> None:
             text = (message.text or "").strip()
@@ -977,7 +1043,7 @@ class ControlBot:
             await cb.message.answer(texts.ASK_PROFILE_NAME)  # type: ignore[union-attr]
             await cb.answer()
 
-        @r.message(ProfileStates.name)
+        @r.message(NotMenuText(), ProfileStates.name)
         @error_guard
         async def prof_name(message: Message, state: FSMContext) -> None:
             name = (message.text or "").strip()
@@ -1075,9 +1141,10 @@ class ControlBot:
             s = await self._db.get_settings(cb.from_user.id)
             items = list(s[field])
             title = texts.IGNORE_LIST_TITLE if field == LIST_IGNORE else texts.WHITELIST_TITLE
-            await cb.message.edit_text(  # type: ignore[union-attr]
+            await self._safe_edit(  # type: ignore[arg-type]
+                cb.message,
                 title.format(items="\n".join(items) or texts.EMPTY_LIST, mode_hint=""),
-                reply_markup=kb.list_manage(items, "ilist" if field == LIST_IGNORE else "wlist"),
+                kb.list_manage(items, "ilist" if field == LIST_IGNORE else "wlist"),
             )
             await cb.answer()
 
@@ -1090,7 +1157,7 @@ class ControlBot:
             await cb.message.answer(texts.ASK_LIST_ADD)  # type: ignore[union-attr]
             await cb.answer()
 
-        @r.message(ListStates.adding)
+        @r.message(NotMenuText(), ListStates.adding)
         @error_guard
         async def list_add_value(message: Message, state: FSMContext) -> None:
             value = (message.text or "").strip()
@@ -1160,7 +1227,7 @@ class ControlBot:
             await cb.message.answer(texts.ASK_COOLDOWN)  # type: ignore[union-attr]
             await cb.answer()
 
-        @r.message(NumberStates.waiting)
+        @r.message(NotMenuText(), NumberStates.waiting)
         @error_guard
         async def number_input(message: Message, state: FSMContext) -> None:
             data = await state.get_data()
@@ -1270,7 +1337,10 @@ class ControlBot:
         await state.update_data(api_id=api_id, api_hash=api_hash)
 
         qr_path = self._config.sessions_dir / f"qr_{user_id}.png"
-        segno.make(qr.url).save(str(qr_path), scale=8, border=2)
+        # segno малює PNG синхронно — не блокуємо цикл подій
+        await asyncio.to_thread(
+            lambda: segno.make(qr.url).save(str(qr_path), scale=8, border=2)
+        )
         token_part = qr.url.split("token=", 1)[-1]
         rows = [[InlineKeyboardButton(
             text="🔓 Підтвердити вхід",
@@ -1319,6 +1389,7 @@ class ControlBot:
             await state.set_state(ConnectStates.password)
             await message.answer(texts.ASK_PASSWORD)
         except asyncio.CancelledError:
+            self._qr_tasks.pop(user_id, None)
             raise
         except Exception:
             self._qr_tasks.pop(user_id, None)
@@ -1497,7 +1568,7 @@ class ControlBot:
 
     async def _refresh_autoreply_menu(self, cb: CallbackQuery) -> None:
         s = await self._db.get_settings(cb.from_user.id)
-        await cb.message.edit_reply_markup(reply_markup=kb.autoreply_menu(  # type: ignore[union-attr]
+        await self._safe_edit_markup(cb.message, kb.autoreply_menu(  # type: ignore[arg-type]
             auto_reply=bool(s["auto_reply"]),
             whitelist_mode=bool(s["whitelist_mode"]),
             only_mention=bool(s["only_private_or_mention"]),
@@ -1512,10 +1583,14 @@ class ControlBot:
         s = await self._db.get_settings(cb.from_user.id)
         items = list(s[field])
         title = texts.IGNORE_LIST_TITLE if field == LIST_IGNORE else texts.WHITELIST_TITLE
-        await cb.message.edit_reply_markup(reply_markup=kb.list_manage(items, prefix))  # type: ignore[union-attr]
+        await self._safe_edit_markup(cb.message, kb.list_manage(items, prefix))  # type: ignore[arg-type]
 
     async def close_pending(self) -> None:
         """Закрити незавершені клієнти підключення (при зупинці застосунку)."""
+        for task in list(self._qr_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._qr_tasks.clear()
         for client in list(self._pending_clients.values()):
             try:
                 await client.disconnect()

@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
@@ -64,6 +65,9 @@ def parse_reminder_time(raw: str, now: datetime | None = None) -> datetime | Non
     if match:
         value = int(match.group(1))
         unit = match.group(2)
+        if value <= 0:
+            # «через 0 хв» — це зараз, а не майбутнє: не приймаємо
+            return None
         return base + timedelta(seconds=value * _UNIT_SECONDS[unit])
 
     try:
@@ -86,15 +90,22 @@ async def reminder_loop(db: Database, send: Callable[[int, str], Awaitable[None]
     """Фоновий цикл: кожні ``interval`` секунд надсилає спровочені нагадування.
 
     ``send(user_id, text)`` — async-колбек надсилання (контрольний бот).
+    Нагадування позначається виконаним ЛИШЕ після успішного надсилання —
+    якщо Telegram недоступний, спроба повториться на наступному тіку.
     """
+    next_tick = time.monotonic() + interval
     while True:
         try:
             due = await db.list_due_reminders(now_local_iso())
             for item in due:
+                sent = False
                 try:
                     await send(int(item["user_id"]), texts.REMINDER_TEXT.format(text=item["text"]))
+                    sent = True
                 except Exception:  # noqa: BLE001 — не роняємо цикл через Telegram
                     logger.exception("Не вдалося надіслати нагадування #%s", item["id"])
+                if not sent:
+                    continue  # спробуємо ще раз на наступному тіку
                 try:
                     await db.mark_reminder_done(int(item["id"]))
                 except Exception:  # noqa: BLE001
@@ -103,7 +114,10 @@ async def reminder_loop(db: Database, send: Callable[[int, str], Awaitable[None]
             raise
         except Exception:  # noqa: BLE001 — цикл живе вічно
             logger.exception("Помилка у фоновому циклі нагадувань")
-        await asyncio.sleep(interval)
+        # фіксований розклад без дрейфу: спимо до наступного тіку, а не interval
+        # від моменту завершення роботи
+        await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+        next_tick += interval
 
 
 def serialize_snapshot(data: dict[str, Any]) -> str:

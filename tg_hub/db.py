@@ -98,6 +98,12 @@ CREATE TABLE IF NOT EXISTS profiles (
     data       TEXT    NOT NULL DEFAULT '{}',
     created_at TEXT    NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_llm_keys_user   ON llm_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_qa_journal_user ON qa_journal(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_reminders_due   ON reminders(done, due_at);
+CREATE INDEX IF NOT EXISTS idx_kb_entries_user ON kb_entries(user_id);
+CREATE INDEX IF NOT EXISTS idx_profiles_user   ON profiles(user_id);
 """
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -117,6 +123,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 _JSON_SETTINGS_FIELDS = frozenset({"whitelist_chats", "ignore_list"})
 _SETTINGS_FIELDS = frozenset(DEFAULT_SETTINGS)
+QA_TEXT_MAX_CHARS = 2000  # ліміт тексту питання/відповіді в журналі Q&A
 
 
 def _now_iso() -> str:
@@ -256,13 +263,17 @@ class Database:
     async def get_prompts(self, user_id: int) -> dict[str, str]:
         return await self._run(self._get_prompt_sync, user_id)
 
+    def _set_prompt_conn(self, conn: sqlite3.Connection, user_id: int,
+                         base_prompt: str) -> None:
+        conn.execute(
+            "INSERT INTO prompts(user_id, base_prompt, style_profile) VALUES (?, ?, '') "
+            "ON CONFLICT(user_id) DO UPDATE SET base_prompt = excluded.base_prompt",
+            (user_id, base_prompt),
+        )
+
     def _set_prompt_sync(self, user_id: int, base_prompt: str) -> None:
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO prompts(user_id, base_prompt, style_profile) VALUES (?, ?, '') "
-                "ON CONFLICT(user_id) DO UPDATE SET base_prompt = excluded.base_prompt",
-                (user_id, base_prompt),
-            )
+            self._set_prompt_conn(conn, user_id, base_prompt)
 
     async def set_base_prompt(self, user_id: int, base_prompt: str) -> None:
         await self._run(self._set_prompt_sync, user_id, base_prompt)
@@ -301,7 +312,8 @@ class Database:
     async def get_settings(self, user_id: int) -> dict[str, Any]:
         return await self._run(self._get_settings_sync, user_id)
 
-    def _update_settings_sync(self, user_id: int, fields: dict[str, Any]) -> None:
+    def _update_settings_conn(self, conn: sqlite3.Connection,
+                              user_id: int, fields: dict[str, Any]) -> None:
         clean = {k: v for k, v in fields.items() if k in _SETTINGS_FIELDS}
         if not clean:
             return
@@ -310,14 +322,16 @@ class Database:
                 clean[field] = json.dumps(clean[field], ensure_ascii=False)
         columns = ", ".join(clean)
         placeholders = ", ".join("?" for _ in clean)
-        assignments = ", ".join(f"{field} = ?" for field in clean)
-        values = [user_id, *clean.values(), *clean.values()]
+        assignments = ", ".join(f"{field} = excluded.{field}" for field in clean)
+        conn.execute(
+            f"INSERT INTO settings(user_id, {columns}) VALUES (?, {placeholders}) "
+            f"ON CONFLICT(user_id) DO UPDATE SET {assignments}",
+            [user_id, *clean.values()],
+        )
+
+    def _update_settings_sync(self, user_id: int, fields: dict[str, Any]) -> None:
         with self._connect() as conn:
-            conn.execute(
-                f"INSERT INTO settings(user_id, {columns}) VALUES (?, {placeholders}) "
-                f"ON CONFLICT(user_id) DO UPDATE SET {assignments}",
-                values,
-            )
+            self._update_settings_conn(conn, user_id, fields)
 
     async def update_settings(self, user_id: int, **fields: Any) -> None:
         await self._run(self._update_settings_sync, user_id, fields)
@@ -415,6 +429,9 @@ class Database:
 
     def _add_qa_entry_sync(self, user_id: int, chat_ref: str, chat_title: str,
                            question: str, answer: str) -> int:
+        # обмежуємо обсяг: журнал не повинен роздувати БД гігантськими текстами
+        question = (question or "")[:QA_TEXT_MAX_CHARS]
+        answer = (answer or "")[:QA_TEXT_MAX_CHARS]
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO qa_journal(user_id, chat_ref, chat_title, question, answer, created_at) "
@@ -570,14 +587,18 @@ class Database:
         """Повний текст бази знань (заголовок + вміст кожного запису)."""
         return await self._run(self._get_full_kb_sync, user_id)
 
+    def _replace_kb_conn(self, conn: sqlite3.Connection, user_id: int,
+                         entries: list[dict[str, Any]]) -> None:
+        conn.execute("DELETE FROM kb_entries WHERE user_id = ?", (user_id,))
+        for item in entries:
+            conn.execute(
+                "INSERT INTO kb_entries(user_id, title, content, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, str(item.get("title", "")), str(item.get("content", "")), _now_iso()),
+            )
+
     def _replace_kb_entries_sync(self, user_id: int, entries: list[dict[str, Any]]) -> None:
         with self._connect() as conn:
-            conn.execute("DELETE FROM kb_entries WHERE user_id = ?", (user_id,))
-            for item in entries:
-                conn.execute(
-                    "INSERT INTO kb_entries(user_id, title, content, created_at) VALUES (?, ?, ?, ?)",
-                    (user_id, str(item.get("title", "")), str(item.get("content", "")), _now_iso()),
-                )
+            self._replace_kb_conn(conn, user_id, entries)
 
     async def replace_kb_entries(self, user_id: int, entries: list[dict[str, Any]]) -> None:
         await self._run(self._replace_kb_entries_sync, user_id, entries)
@@ -628,22 +649,26 @@ class Database:
         return await self._run(self._delete_profile_sync, user_id, profile_id)
 
     def _apply_profile_sync(self, user_id: int, profile_id: int) -> bool:
-        """Застосувати профіль: скопіювати його значення в settings/prompts/kb_entries."""
+        """Застосувати профіль: скопіювати його значення в settings/prompts/kb_entries.
+
+        Усі три зміни — в ОДНІЙ транзакції: збій на півдорозі не лишає
+        напівзастосованого профілю.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM profiles WHERE id = ? AND user_id = ?", (profile_id, user_id)
             ).fetchone()
-        if row is None:
-            return False
-        try:
-            data = json.loads(row["data"] or "{}")
-        except json.JSONDecodeError:
-            data = {}
-        fields = {k: v for k, v in (data.get("settings") or {}).items() if k in _SETTINGS_FIELDS}
-        fields["profile_name"] = row["name"]
-        self._update_settings_sync(user_id, fields)
-        self._set_prompt_sync(user_id, str(data.get("base_prompt") or ""))
-        self._replace_kb_entries_sync(user_id, list(data.get("kb") or []))
+            if row is None:
+                return False
+            try:
+                data = json.loads(row["data"] or "{}")
+            except json.JSONDecodeError:
+                data = {}
+            fields = {k: v for k, v in (data.get("settings") or {}).items() if k in _SETTINGS_FIELDS}
+            fields["profile_name"] = row["name"]
+            self._update_settings_conn(conn, user_id, fields)
+            self._set_prompt_conn(conn, user_id, str(data.get("base_prompt") or ""))
+            self._replace_kb_conn(conn, user_id, list(data.get("kb") or []))
         return True
 
     async def apply_profile(self, user_id: int, profile_id: int) -> bool:

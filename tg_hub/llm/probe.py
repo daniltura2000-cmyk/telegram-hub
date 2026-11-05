@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-PROBE_TIMEOUT = 15.0
+PROBE_TIMEOUT = 30.0
 
 _NON_CHAT_MARKERS = (
     "embedding", "whisper", "tts", "dall-e", "moderation", "image",
@@ -100,6 +100,12 @@ async def probe_key(provider: str, base_url: str, api_key: str) -> list[str]:
 # збереженням робимо мінімальний реальний виклик.
 
 
+MODEL_429_WARNING = (
+    "⚠️ Модель відповіла HTTP 429 (ліміт запитів) — ключ усе одно збережено. "
+    "Якщо ліміт не зникне, авто-відповіді можуть тимчасово не працювати."
+)
+
+
 def _model_http_error(status: int, model: str) -> str:
     if status == 404:
         return f"❌ Модель «{model}» не існує або недоступна для вашого ключа (HTTP 404)."
@@ -108,16 +114,17 @@ def _model_http_error(status: int, model: str) -> str:
             f"❌ Немає доступу до «{model}» (HTTP 403). Модель у списку, але вимагає "
             f"окремого доступу/підписки — оберіть іншу."
         )
-    if status == 429:
-        return (
-            f"❌ «{model}» відповіла 429 — квота саме цієї моделі вичерпана. "
-            f"Оберіть іншу модель або спробуйте пізніше."
-        )
     return f"❌ Провайдер відхилив модель «{model}» (HTTP {status}). Оберіть іншу."
 
 
-async def verify_model(provider: str, base_url: str, api_key: str, model: str) -> None:
-    """Мінімальний реальний виклик моделі; кидає ProbeError, якщо вона не працює."""
+async def verify_model(provider: str, base_url: str, api_key: str, model: str) -> str | None:
+    """Мінімальний реальний виклик моделі.
+
+    Кидає :class:`ProbeError`, якщо модель точно не працює (403/404 та інші
+    помилки запиту). HTTP 429 (тимчасовий ліміт запитів — типово для
+    безкоштовних тарифів) НЕ блокує збереження: повертається рядок-попередження.
+    ``None`` — усе гаразд.
+    """
     if provider == "openai":
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -128,9 +135,7 @@ async def verify_model(provider: str, base_url: str, api_key: str, model: str) -
         }
         async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, json=payload, timeout=PROBE_TIMEOUT)
-        if response.status_code != 200:
-            raise ProbeError(_model_http_error(response.status_code, model))
-        return
+        return _verify_outcome(response, model)
     if provider == "google":
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         params = {"key": api_key}
@@ -139,9 +144,7 @@ async def verify_model(provider: str, base_url: str, api_key: str, model: str) -
             response = await client.post(
                 url, params=params, json=payload, timeout=PROBE_TIMEOUT,
             )
-        if response.status_code != 200:
-            raise ProbeError(_model_http_error(response.status_code, model))
-        return
+        return _verify_outcome(response, model)
     if provider == "anthropic":
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
                    "content-type": "application/json"}
@@ -154,7 +157,14 @@ async def verify_model(provider: str, base_url: str, api_key: str, model: str) -
                 "https://api.anthropic.com/v1/messages",
                 headers=headers, json=payload, timeout=PROBE_TIMEOUT,
             )
-        if response.status_code != 200:
-            raise ProbeError(_model_http_error(response.status_code, model))
-        return
+        return _verify_outcome(response, model)
     raise ProbeError(f"❌ Невідомий провайдер: {provider}")
+
+
+def _verify_outcome(response: httpx.Response, model: str) -> str | None:
+    """429 → попередження (модель зберігаємо); інші помилки → ProbeError."""
+    if response.status_code == 429:
+        return MODEL_429_WARNING
+    if response.status_code != 200:
+        raise ProbeError(_model_http_error(response.status_code, model))
+    return None

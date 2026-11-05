@@ -94,24 +94,31 @@ async def run() -> None:
 
     polling_task = asyncio.create_task(dp.start_polling(bot))
     stop_task = asyncio.create_task(stop_event.wait())
-    done, pending = await asyncio.wait(
-        {polling_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-    )
-
-    for task in pending:
-        task.cancel()
-    reminders_task.cancel()
     try:
-        await polling_task
-    except asyncio.CancelledError:
-        pass
-    finally:
+        done, pending = await asyncio.wait(
+            {polling_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
         try:
-            await reminders_task
+            await polling_task
         except asyncio.CancelledError:
             pass
-        except Exception:  # noqa: BLE001 — зупинка не повинна падати
-            logger.exception("Помилка зупинки циклу нагадувань")
+    finally:
+        # Очищення ГАРАНТОВАНО виконується і при зовнішній отмені run()
+        # (Windows: KeyboardInterrupt перетворюється asyncio.run на CancelledError),
+        # і при штатному сигналі зупинки.
+        for task in (stop_task, polling_task, reminders_task):
+            task.cancel()
+        for task, name in ((polling_task, "polling"), (reminders_task, "reminders"),
+                           (stop_task, "stop")):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 — зупинка не повинна падати
+                logger.exception("Помилка зупинки задачі %s", name)
+        # нагадування вже зупинено вище — тепер можна безпечно закривати клієнтів
         await userbot.stop()
         await bot.session.close()
         logger.info("TelegramHub зупинено")

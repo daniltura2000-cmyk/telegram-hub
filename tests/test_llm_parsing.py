@@ -254,3 +254,106 @@ async def test_post_json_gives_up_after_max_retries():
     with pytest.raises(LLMError, match="3 спроб"):
         await client._post_json(fake, "http://x", {}, {})
     assert fake.calls == 3  # DEFAULT_MAX_RETRIES
+
+
+# ------------------------------------------------------------- Retry-After
+
+@pytest.mark.asyncio
+async def test_post_json_honors_retry_after_header(monkeypatch):
+    import tg_hub.llm.base as base
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(base.asyncio, "sleep", fake_sleep)
+    resp429 = _FakeResponse(429, {})
+    resp429.headers = {"Retry-After": "7"}
+    client = OpenAICompatClient("https://api.example.com", "key", "m", backoff_base=0)
+    fake = _FakeClient([resp429, _FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})])
+    await client._post_json(fake, "http://x", {}, {})
+    assert sleeps == [7.0]  # Retry-After поважається замість backoff_base=0
+
+
+@pytest.mark.asyncio
+async def test_post_json_without_retry_after_uses_backoff(monkeypatch):
+    import tg_hub.llm.base as base
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(base.asyncio, "sleep", fake_sleep)
+    client = OpenAICompatClient("https://api.example.com", "key", "m", backoff_base=0)
+    fake = _FakeClient([_FakeResponse(429, {}), _FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})])
+    await client._post_json(fake, "http://x", {}, {})
+    assert sleeps == [0.0]  # немає заголовка → звичайний backoff
+
+
+# ------------------------------------- verify_model: 429 не блокує збереження
+
+class _FakeVerifyClient:
+    """Підставник httpx.AsyncClient для verify_model (повертає заготовлений статус)."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+    async def __aenter__(self) -> "_FakeVerifyClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> bool:
+        return False
+
+    async def post(self, url, headers=None, json=None, params=None, timeout=None):  # noqa: A002
+        return _FakeResponse(self.status_code, {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["google", "openai", "anthropic"])
+async def test_verify_model_429_warns_and_allows_saving(monkeypatch, provider):
+    import tg_hub.llm.probe as probe
+
+    monkeypatch.setattr(
+        probe.httpx, "AsyncClient", lambda: _FakeVerifyClient(429)
+    )
+    warning = await probe.verify_model(provider, "https://api.example.com", "key", "some-model")
+    assert warning is not None
+    assert "429" in warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 404])
+async def test_verify_model_403_404_reject(monkeypatch, status):
+    import tg_hub.llm.probe as probe
+    from tg_hub.llm.probe import ProbeError
+
+    monkeypatch.setattr(probe.httpx, "AsyncClient", lambda: _FakeVerifyClient(status))
+    with pytest.raises(ProbeError):
+        await probe.verify_model("google", None, "key", "gemini-x")
+
+
+@pytest.mark.asyncio
+async def test_verify_model_ok_returns_none(monkeypatch):
+    import tg_hub.llm.probe as probe
+
+    monkeypatch.setattr(probe.httpx, "AsyncClient", lambda: _FakeVerifyClient(200))
+    assert await probe.verify_model("google", None, "key", "gemini-x") is None
+
+
+# ------------------------------------ NotMenuText: FSM не з'їдає кнопки меню
+
+@pytest.mark.asyncio
+async def test_not_menu_text_filter():
+    from tg_hub.control_bot import NotMenuText, _MENU_TEXTS
+
+    class _Msg:
+        def __init__(self, text: object) -> None:
+            self.text = text
+
+    f = NotMenuText()
+    for button in _MENU_TEXTS:  # кнопки меню мають «проскочувати» повз FSM-обробники
+        assert await f(_Msg(button)) is False
+    assert await f(_Msg("звичайне повідомлення")) is True
+    assert await f(_Msg(None)) is True  # медіа без тексту не блокуємо

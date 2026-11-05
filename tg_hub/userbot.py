@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from telethon import TelegramClient, events
+from telethon.tl import types as tl_types
 
 from .config import Config
 from .db import Database
@@ -127,6 +128,9 @@ class Userbot:
         self._pending: dict[int, list[str]] = {}
         self._debounce_tasks: dict[int, asyncio.Task[None]] = {}
         self._typing_until: dict[int, float] = {}  # chat_id -> до коли «друкує»
+        # кеш об'єктів чатів (мережевий get_chat — раз на 5 хв на чат)
+        self.CHAT_CACHE_TTL = 300.0
+        self._chat_cache: dict[int, tuple[Any, float]] = {}
 
     # --- життєвий цикл ---
 
@@ -172,6 +176,9 @@ class Userbot:
             task.cancel()
         self._debounce_tasks.clear()
         self._pending.clear()
+        self._typing_until.clear()
+        self._cooldowns.clear()
+        self._chat_cache.clear()
         if self.client is not None:
             try:
                 await self.client.disconnect()
@@ -220,11 +227,14 @@ class Userbot:
 
     async def _on_user_update(self, event: Any) -> None:
         """Співрозмовник друкує → продовжуємо чекати (максимум MAX_BURST_WAIT)."""
-        if not getattr(event, "typing", False):
-            return
-        chat_id = getattr(event, "chat_id", None) or getattr(event, "user_id", None)
-        if chat_id in self._pending:
-            self._typing_until[chat_id] = time.monotonic() + TYPING_GRACE
+        try:
+            if not getattr(event, "typing", False):
+                return
+            chat_id = getattr(event, "chat_id", None) or getattr(event, "user_id", None)
+            if chat_id in self._pending:
+                self._typing_until[chat_id] = time.monotonic() + TYPING_GRACE
+        except Exception:  # noqa: BLE001 — подія «друкує» не повинна падати в диспетчер
+            logger.exception("Помилка обробки UserUpdate")
 
     async def _debounced_reply(self, chat_id: int, user_id: int, settings: dict[str, Any]) -> None:
         """Чекає тишу (і паузи «друкує»), потім ОДНА відповідь на весь burst."""
@@ -252,8 +262,11 @@ class Userbot:
             reply = await self._generate_reply(user_id, settings, chat_id, burst)
             if not reply:
                 return
-            self._cooldowns[chat_id] = time.monotonic()
             await self._humanized_send(chat_id, reply, settings)
+            # кулдаун стартує лише після УСПІШНОГО надсилання: якщо send_message
+            # впав — наступне повідомлення не блокується «порожнім» кулдауном
+            self._cooldowns[chat_id] = time.monotonic()
+            self._typing_until.pop(chat_id, None)  # не накопичуємо застарілі записи
             await self._record_qa_entry(user_id, chat_id, burst, reply)
         except LLMError as exc:
             await self._record_error(chat_id, f"LLM: {exc}")
@@ -264,11 +277,28 @@ class Userbot:
 
     # --- фільтри ---
 
-    async def _passes_filters(self, message: Any, settings: dict[str, Any]) -> bool:
-        # message.chat — це Peer без username; повний об'єкт беремо через get_chat()
+    async def _get_chat_cached(self, message: Any) -> Any | None:
+        """get_chat() з кешем на 5 хвилин: мережевий виклик — раз на чат, не на кожне повідомлення серії."""
+        chat_id = message.chat_id
+        now = time.monotonic()
+        cached = self._chat_cache.get(chat_id)
+        if cached is not None and now - cached[1] < self.CHAT_CACHE_TTL:
+            return cached[0]
         try:
             chat = await message.get_chat()
         except Exception:  # noqa: BLE001 — чат недоступний → не ризикуємо
+            return None
+        self._chat_cache[chat_id] = (chat, now)
+        if len(self._chat_cache) > 500:  # захист від безмежного росту
+            stale = sorted(self._chat_cache.items(), key=lambda kv: kv[1][1])[:100]
+            for key, _ in stale:
+                self._chat_cache.pop(key, None)
+        return chat
+
+    async def _passes_filters(self, message: Any, settings: dict[str, Any]) -> bool:
+        # message.chat — це Peer без username; повний об'єкт беремо через get_chat()
+        chat = await self._get_chat_cached(message)
+        if chat is None:
             return False
         username = getattr(chat, "username", None)
         chat_id = str(chat.id if chat is not None else message.chat_id)
@@ -287,7 +317,9 @@ class Userbot:
                 return False
 
         if settings["only_private_or_mention"]:
-            is_private = bool(getattr(message, "is_private", False))
+            # Telethon Message не має атрибута is_private — приватність визначаємо
+            # за типом чату: особистий чат — це завжди User (не Chat/Channel).
+            is_private = isinstance(chat, tl_types.User)
             mentioned = bool(getattr(message, "mentioned", False))
             own_handle = self._own_username.lstrip("@")
             text_hit = bool(own_handle) and own_handle in (message.message or "").lower()
