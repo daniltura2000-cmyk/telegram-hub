@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 1.5
+DEFAULT_MAX_TOKENS = 200  # відповідь у чаті має бути короткою — це лімітує і час генерації
 
 
 class LLMError(Exception):
@@ -42,6 +43,7 @@ class BaseLLMClient(abc.ABC):
         timeout: float = 60.0,
         max_retries: int = DEFAULT_MAX_RETRIES,
         backoff_base: float = DEFAULT_BACKOFF_BASE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> None:
         if not api_key:
             raise ValueError("API-ключ не може бути порожнім")
@@ -52,6 +54,7 @@ class BaseLLMClient(abc.ABC):
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
         self.backoff_base = backoff_base
+        self.max_tokens = max(32, int(max_tokens))
 
     @abc.abstractmethod
     async def chat(self, messages: list[dict[str, str]], system: str = "") -> str:

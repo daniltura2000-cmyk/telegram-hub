@@ -249,6 +249,7 @@ class ControlBot:
             provider=key["provider"], base_url=key["base_url"],
             api_key=key["api_key"], model=key["model"],
             timeout=self._config.llm_timeout,
+            max_tokens=1500,  # профіль — довгий текст, ліміт лише для чат-відповідей
         )
         assert self._userbot.client is not None
         resolved: list[Any] = []
@@ -915,6 +916,7 @@ class ControlBot:
                 provider=key["provider"], base_url=key["base_url"],
                 api_key=key["api_key"], model=key["model"],
                 timeout=self._config.llm_timeout,
+                max_tokens=1500,  # профіль — довгий текст, ліміт лише для чат-відповідей
             )
             assert self._userbot.client is not None
             await cb.answer()  # зняти спінер одразу

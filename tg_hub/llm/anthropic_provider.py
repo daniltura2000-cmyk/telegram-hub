@@ -47,7 +47,8 @@ class AnthropicClient(BaseLLMClient):
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
-        payload = build_anthropic_payload(self.model, messages, system)
+        payload = build_anthropic_payload(self.model, messages, system,
+                                          max_tokens=self.max_tokens)
         async with httpx.AsyncClient() as client:
             data = await self._post_json(client, ANTHROPIC_URL, headers, payload)
         return parse_anthropic_response(data)

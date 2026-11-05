@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 DEFAULT_DATABASE_PATH = "data/hub.db"
 DEFAULT_LLM_TIMEOUT = 60.0
+DEFAULT_LLM_MAX_TOKENS = 200
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_ANALYSIS_LIMIT = 500
 
@@ -27,6 +28,7 @@ class Config:
     telegram_api_hash: str | None
     database_path: Path
     llm_timeout: float
+    llm_max_tokens: int
     log_level: str
     analysis_limit: int
 
@@ -84,6 +86,12 @@ def load_config(env_file: str | os.PathLike[str] | None = ".env") -> Config:
     except ValueError:
         llm_timeout = DEFAULT_LLM_TIMEOUT
 
+    tokens_raw = (os.getenv("LLM_MAX_TOKENS") or "").strip()
+    try:
+        llm_max_tokens = int(tokens_raw) if tokens_raw else DEFAULT_LLM_MAX_TOKENS
+    except ValueError:
+        llm_max_tokens = DEFAULT_LLM_MAX_TOKENS
+
     analysis_raw = (os.getenv("ANALYSIS_LIMIT") or "").strip()
     try:
         analysis_limit = int(analysis_raw) if analysis_raw else DEFAULT_ANALYSIS_LIMIT
@@ -97,6 +105,7 @@ def load_config(env_file: str | os.PathLike[str] | None = ".env") -> Config:
         telegram_api_hash=api_hash,
         database_path=Path(os.getenv("DATABASE_PATH") or DEFAULT_DATABASE_PATH),
         llm_timeout=llm_timeout,
+        llm_max_tokens=llm_max_tokens,
         log_level=(os.getenv("LOG_LEVEL") or DEFAULT_LOG_LEVEL).upper(),
         analysis_limit=analysis_limit,
     )

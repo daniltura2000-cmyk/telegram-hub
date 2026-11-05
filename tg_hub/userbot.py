@@ -426,6 +426,7 @@ class Userbot:
             api_key=key["api_key"],
             model=key["model"],
             timeout=self._config.llm_timeout,
+            max_tokens=self._config.llm_max_tokens,
         )
         prompts = await self._db.get_prompts(user_id)
         context = await self._build_context(chat_id, int(settings["context_messages"]))

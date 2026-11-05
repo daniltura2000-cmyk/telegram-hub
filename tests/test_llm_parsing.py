@@ -482,3 +482,33 @@ async def test_not_menu_text_filter():
         assert await f(_Msg(button)) is False
     assert await f(_Msg("звичайне повідомлення")) is True
     assert await f(_Msg(None)) is True  # медіа без тексту не блокуємо
+
+
+def test_openai_payload_has_max_tokens():
+    from tg_hub.llm.openai_compat import build_openai_payload
+    payload = build_openai_payload("m", [{"role": "user", "content": "hi"}], "sys", max_tokens=200)
+    assert payload["max_tokens"] == 200
+
+
+def test_google_payload_max_tokens_and_thinking():
+    from tg_hub.llm.google_provider import (
+        _flash_model_can_disable_thinking,
+        build_google_payload,
+        parse_google_response,
+    )
+    payload = build_google_payload(
+        [{"role": "user", "content": "hi"}], "sys", max_tokens=150, disable_thinking=True,
+    )
+    assert payload["generationConfig"]["maxOutputTokens"] == 150
+    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    plain = build_google_payload([{"role": "user", "content": "hi"}], "", max_tokens=150)
+    assert "thinkingConfig" not in plain["generationConfig"]
+    assert _flash_model_can_disable_thinking("gemini-3.6-flash")
+    assert _flash_model_can_disable_thinking("gemini-2.5-flash")
+    assert not _flash_model_can_disable_thinking("gemini-2.5-pro")
+    assert not _flash_model_can_disable_thinking("gemma-4-31b-it")
+    # думання не просочується у відповідь
+    data = {"candidates": [{"content": {"parts": [
+        {"text": "приховані думки", "thought": True}, {"text": "ок"},
+    ]}}]}
+    assert parse_google_response(data) == "ок"
