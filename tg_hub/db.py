@@ -94,9 +94,18 @@ CREATE TABLE IF NOT EXISTS kb_entries (
 CREATE TABLE IF NOT EXISTS profiles (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL,
-    name       TEXT    NOT NULL,
-    data       TEXT    NOT NULL DEFAULT '{}',
-    created_at TEXT    NOT NULL
+    name       TEXT NOT NULL,
+    data       TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_profiles (
+    user_id     INTEGER NOT NULL,
+    chat_ref    TEXT NOT NULL,
+    profile     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (user_id, chat_ref)
 );
 
 CREATE INDEX IF NOT EXISTS idx_llm_keys_user   ON llm_keys(user_id);
@@ -288,6 +297,57 @@ class Database:
 
     async def set_style_profile(self, user_id: int, style_profile: str) -> None:
         await self._run(self._set_style_sync, user_id, style_profile)
+
+    # --- пер-чат профілі стилю ---
+
+    def _save_chat_profile_sync(self, user_id: int, chat_ref: str, profile: str) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO chat_profiles(user_id, chat_ref, profile, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, chat_ref) DO UPDATE SET "
+                "profile = excluded.profile, updated_at = excluded.updated_at",
+                (user_id, chat_ref, profile, now, now),
+            )
+
+    async def save_chat_profile(self, user_id: int, chat_ref: str, profile: str) -> None:
+        await self._run(self._save_chat_profile_sync, user_id, chat_ref, profile)
+
+    def _get_chat_profile_sync(self, user_id: int, chat_ref: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT profile FROM chat_profiles WHERE user_id = ? AND chat_ref = ?",
+                (user_id, chat_ref),
+            ).fetchone()
+        return (row["profile"] or "") if row else ""
+
+    async def get_chat_profile(self, user_id: int, chat_ref: str) -> str:
+        return await self._run(self._get_chat_profile_sync, user_id, chat_ref)
+
+    def _list_chat_profiles_sync(self, user_id: int) -> list[dict[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT chat_ref, profile, updated_at FROM chat_profiles "
+                "WHERE user_id = ? ORDER BY updated_at DESC",
+                (user_id,),
+            ).fetchall()
+        return [
+            {"chat_ref": r["chat_ref"], "profile": r["profile"] or "", "updated_at": r["updated_at"]}
+            for r in rows
+        ]
+
+    async def list_chat_profiles(self, user_id: int) -> list[dict[str, str]]:
+        return await self._run(self._list_chat_profiles_sync, user_id)
+
+    async def delete_chat_profile(self, user_id: int, chat_ref: str) -> None:
+        def _del() -> None:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM chat_profiles WHERE user_id = ? AND chat_ref = ?",
+                    (user_id, chat_ref),
+                )
+        await self._run(_del)
 
     # --- налаштування ---
 

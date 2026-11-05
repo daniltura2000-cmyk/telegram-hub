@@ -199,6 +199,7 @@ def style_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=texts.BTN_STYLE_SHOW, callback_data="style:show"),
             InlineKeyboardButton(text=texts.BTN_STYLE_REGEN, callback_data="style:regen"),
         ],
+        [InlineKeyboardButton(text=texts.BTN_CHAT_PROFILE, callback_data="style:perchat")],
         *back_button_row(),
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -209,6 +210,31 @@ def dialogs_one(dialogs: list[tuple[int, str, str]]) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=title, callback_data=f"style:pickone:{ref}")]
         for _chat_id, title, ref in dialogs
+    ]
+    if not rows:
+        rows = [[InlineKeyboardButton(text="—", callback_data="noop")]]
+    rows.extend(back_button_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def dialogs_perchat(dialogs: list[tuple[int, str, str]]) -> InlineKeyboardMarkup:
+    """Список діалогів для створення ПЕР-ЧАТ профілю."""
+    rows = [
+        [InlineKeyboardButton(text=title, callback_data=f"cp:make:{ref}")]
+        for _chat_id, title, ref in dialogs
+    ]
+    if not rows:
+        rows = [[InlineKeyboardButton(text="—", callback_data="noop")]]
+    rows.extend(back_button_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def chat_profile_list(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """Пер-чат профілі: (chat_ref, title) — кнопка показу, видалення окремо."""
+    rows = [
+        [InlineKeyboardButton(text=f"👤 {title}", callback_data=f"cp:show:{ref}"),
+         InlineKeyboardButton(text="🗑", callback_data=f"cp:del:{ref}")]
+        for ref, title in items
     ]
     if not rows:
         rows = [[InlineKeyboardButton(text="—", callback_data="noop")]]

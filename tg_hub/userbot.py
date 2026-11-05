@@ -388,12 +388,19 @@ class Userbot:
         assert self.client is not None
         messages = await self.client.get_messages(chat_ref, limit=max(1, limit))
         pairs: list[tuple[bool, str, str | None]] = []
+        today = datetime.now().astimezone().date()
         for msg in reversed(messages):  # get_messages повертає від нових до старих
             text = (msg.message or "").strip() if msg.message else ""
             if text:
                 time_label = None
                 try:
-                    time_label = msg.date.astimezone().strftime("%H:%M")
+                    local_date = msg.date.astimezone().date()
+                    if local_date == today:
+                        time_label = msg.date.astimezone().strftime("%H:%M")
+                    else:
+                        # день обов'язковий: промпт просить модель розрізняти
+                        # «старий контекст» (інші дні) і сьогоднішні повідомлення
+                        time_label = msg.date.astimezone().strftime("%d.%m %H:%M")
                 except Exception:  # noqa: BLE001 — без часу теж ок
                     pass
                 pairs.append((bool(msg.out), text, time_label))
@@ -422,7 +429,10 @@ class Userbot:
         )
         prompts = await self._db.get_prompts(user_id)
         context = await self._build_context(chat_id, int(settings["context_messages"]))
-        system = self._system_prompt(prompts["base_prompt"], prompts["style_profile"])
+        # пер-чат профіль має пріоритет над глобальним
+        chat_profile = await self._db.get_chat_profile(user_id, str(chat_id))
+        style = chat_profile or prompts["style_profile"]
+        system = self._system_prompt(prompts["base_prompt"], style)
         kb_text = await self._db.get_full_kb(user_id)
         if kb_text:
             system += (
@@ -433,6 +443,16 @@ class Userbot:
         user_content = (
             f"Історія діалогу (у квадратних дужках — місцевий час):\n{context}\n\n"
             f"Зараз: [{current_time}]\n\n"
+            "ЯК АНАЛІЗУВАТИ КОНТЕКСТ:\n"
+            "1. Подивись на часові мітки (сьогоднішні — [ГГ:ХХ], давніші — "
+            "[ДД.ММ ГГ:ХХ]): повідомлення з інших днів або давно "
+            "завершені теми — це СТАРИЙ КОНТЕКСТ. Тримай його на увазі (згадай, "
+            "якщо співрозмовник повертається до нього), але не відповідай на нього.\n"
+            "2. Останні повідомлення співрозмовника порівняй зі старим контекстом: "
+            "якщо це ПРОДОВЖЕННЯ попередньої теми — відповідай у її руслі, "
+            "як НОВА ТЕМА — відповідай на нову тему, не тягни стару.\n"
+            "3. Відповідай природно, як жива людина: коротко, без офіційності, "
+            "варіюй формулювання. Не переказуй питання — відповідай на нього.\n\n"
             f"Щойно надійшло від співрозмовника (може бути кілька повідомлень підряд — "
             f"прочитай їх як одне ціле і відповіси на все разом):\n{latest}\n\n"
             "Напиши МОЮ відповідь (лише текст повідомлення, без лапок і пояснень). "

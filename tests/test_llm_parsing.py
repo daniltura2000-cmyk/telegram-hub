@@ -18,8 +18,17 @@ from tg_hub.llm import (
 from tg_hub.llm.anthropic_provider import build_anthropic_payload, parse_anthropic_response
 from tg_hub.llm.google_provider import build_google_payload, build_google_url, parse_google_response
 from tg_hub.llm.openai_compat import build_openai_payload, parse_openai_response
-from tg_hub.persona.analyzer import build_style_user_prompt
-from tg_hub.persona.styles import DEFAULT_BASE_PROMPT, DEFAULT_STYLE_META_PROMPT
+from tg_hub.persona.analyzer import (
+    DEFAULT_SAMPLE_CHAR_LIMIT,
+    build_dialogue_user_prompt,
+    build_style_user_prompt,
+    generate_chat_profile,
+)
+from tg_hub.persona.styles import (
+    DEFAULT_BASE_PROMPT,
+    DEFAULT_CHAT_PROFILE_META_PROMPT,
+    DEFAULT_STYLE_META_PROMPT,
+)
 from tg_hub.userbot import format_context, split_reply, strip_markdown_artifacts
 
 MESSAGES = [
@@ -208,12 +217,106 @@ def test_build_style_user_prompt_truncates():
     samples = [" повідомлення " * 1000 for _ in range(30)]  # ~37k символів на вибірку
     prompt = build_style_user_prompt(samples, char_limit=1500)
     assert len(prompt) < len(DEFAULT_STYLE_META_PROMPT) + 1600 + 200
-    assert "=== ВИБІРКА ПОВІДОМЛЕНЬ ===" in prompt
+    assert "=== ВИБІРКА ПОВІДОМЛЕНЬ ===" in prompt  # глобальний мета-промпт, не діалоговий
+    assert "ДІАЛОГ однієї людини" not in prompt
 
 
 def test_build_style_user_prompt_skips_empty():
     prompt = build_style_user_prompt(["", "   ", "Реальний текст"])
     assert "Реальний текст" in prompt
+
+
+# ------------------------------------------------------- пер-чат профілі (діалог)
+
+def test_build_dialogue_user_prompt_labels_and_order():
+    pairs = [
+        (True, "Привіт, як справи?", "05.11"),
+        (False, "Привіт! Все добре", "05.11"),
+        (True, "Радий чути", None),
+    ]
+    prompt = build_dialogue_user_prompt(pairs, char_limit=DEFAULT_SAMPLE_CHAR_LIMIT)
+    assert "[05.11] Я: Привіт, як справи?" in prompt
+    assert "[05.11] Інший: Привіт! Все добре" in prompt
+    assert "Я: Радий чути" in prompt  # без дати — без мітки
+    # діалоговий мета-промпт, не глобальний
+    assert "=== ДІАЛОГ ===" in prompt
+    assert "ВЗАЄМОДІЮ" in prompt
+
+
+def test_build_dialogue_user_prompt_truncates_at_char_limit():
+    long_text = "дуже довге повідомлення " * 100  # ~2400 символів
+    pairs = [(i % 2 == 0, long_text, "01.01") for i in range(10)]
+    prompt = build_dialogue_user_prompt(pairs, char_limit=500)
+    block = prompt.split("=== ДІАЛОГ ===\n", 1)[1].split("\n=== КІНЕЦЬ ДІАЛОГУ ===", 1)[0]
+    # сума рядків вибірки обмежена char_limit (+ розділювачі між рядками)
+    assert len(block) <= 500 + 10
+    assert block  # щось потрапило у вибірку
+
+
+class _FakeMsg:
+    def __init__(self, text: str, out: bool, date) -> None:
+        self.message = text
+        self.out = out
+        self.date = date
+
+
+class _FakeTelethonClient:
+    """iter_messages повертає від НОВИХ до старих — як справжній Telethon."""
+
+    def __init__(self, messages: list[_FakeMsg]) -> None:
+        self._messages = messages
+
+    async def get_entity(self, entity):
+        return entity
+
+    def iter_messages(self, entity, limit, from_user=None):  # noqa: A002
+        async def _gen():
+            for msg in self._messages[:limit]:
+                yield msg
+        return _gen()
+
+
+class _FakeLLM:
+    def __init__(self) -> None:
+        self.captured: dict = {}
+
+    async def chat(self, messages, system=None):  # noqa: A002
+        self.captured = {"messages": messages, "system": system}
+        return "ПРОФІЛЬ: пишу з великої літери, жіночий рід"
+
+
+@pytest.mark.asyncio
+async def test_generate_chat_profile_reversed_chronology_and_labels():
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 11, 5, 12, 0, tzinfo=timezone.utc)
+    # Telethon: від нових до старих
+    messages = [
+        _FakeMsg("третє (найновіше)", False, now),
+        _FakeMsg("друге", True, now - timedelta(hours=2)),
+        _FakeMsg("перше (найстаріше)", True, now - timedelta(days=3)),
+    ]
+    llm = _FakeLLM()
+    profile = await generate_chat_profile(
+        _FakeTelethonClient(messages), llm, 12345, char_limit=DEFAULT_SAMPLE_CHAR_LIMIT,
+    )
+    assert profile == "ПРОФІЛЬ: пишу з великої літери, жіночий рід"
+    prompt = llm.captured["messages"][0]["content"]
+    assert "Я:" in prompt and "Інший:" in prompt
+    # хронологія: найстаріше — першим, найновіше — останнім
+    first, second, third = prompt.index("перше"), prompt.index("друге"), prompt.index("третє")
+    assert first < second < third
+    # мітки дат у форматі ДД.ММ
+    assert "[02.11] Я: перше (найстаріше)" in prompt
+    assert "[05.11] Інший: третє (найновіше)" in prompt
+    assert "=== ДІАЛОГ ===" in prompt
+    assert "стилістики" in (llm.captured["system"] or "")
+
+
+@pytest.mark.asyncio
+async def test_generate_chat_profile_raises_on_empty_dialogue():
+    with pytest.raises(ValueError):
+        await generate_chat_profile(_FakeTelethonClient([]), _FakeLLM(), 12345)
 
 
 # ---------------------------------------------------------------- повтори (backoff)

@@ -304,3 +304,27 @@ async def test_qa_entry_texts_capped(db: Database):
     await db.add_qa_entry(1, "@chat", "Чат", "коротке", "коротка")
     short = (await db.list_qa_entries(1))[0]
     assert short["question"] == "коротке" and short["answer"] == "коротка"
+
+
+@pytest.mark.asyncio
+async def test_chat_profile_roundtrip(db):
+    # негативний chat_ref (супергрупи Bot API: -100...) проходить повний цикл
+    await db.save_chat_profile(1, "-100300", "Профіль: пишу з великої, жартую")
+    got = await db.get_chat_profile(1, "-100300")
+    assert "жартую" in got
+    # upsert: повторне збереження оновлює, а не дублює
+    await db.save_chat_profile(1, "-100300", "Оновлений")
+    assert (await db.get_chat_profile(1, "-100300")) == "Оновлений"
+    assert (await db.get_chat_profile(1, "999")) == ""
+    assert (await db.get_chat_profile(2, "-100300")) == ""  # чужий user_id не бачить
+    rows = await db.list_chat_profiles(1)
+    assert len(rows) == 1 and rows[0]["chat_ref"] == "-100300"
+    # приватний чат: позитивний id теж працює
+    await db.save_chat_profile(1, "123456789", "Інший профіль")
+    assert (await db.get_chat_profile(1, "123456789")) == "Інший профіль"
+    assert len(await db.list_chat_profiles(1)) == 2
+    await db.delete_chat_profile(1, "-100300")
+    assert (await db.get_chat_profile(1, "-100300")) == ""
+    assert len(await db.list_chat_profiles(1)) == 1
+    # видалення неіснуючого — тихо, без помилок
+    await db.delete_chat_profile(1, "-100300")

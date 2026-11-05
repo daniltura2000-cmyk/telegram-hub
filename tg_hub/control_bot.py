@@ -38,6 +38,7 @@ from .db import Database
 from .llm import create_client
 from .llm.probe import ProbeError, probe_key, verify_model
 from .persona import DEFAULT_BASE_PROMPT, generate_style_profile
+from .persona.analyzer import generate_chat_profile
 from .reminders import format_due, parse_reminder_time, serialize_snapshot
 from .userbot import Userbot
 
@@ -846,6 +847,99 @@ class ControlBot:
             await cb.answer()  # зняти спінер одразу: аналіз триває до хвилини
             await cb.message.answer(texts.ANALYSIS_STARTED.format(limit=self._config.analysis_limit))  # type: ignore[union-attr]
             await self._run_style_analysis(cb.from_user.id, refs, cb.message)  # type: ignore[arg-type]
+
+        # ------------------------------------------------------ пер-чат профілі
+
+        @r.callback_query(F.data == "style:perchat")
+        @error_guard
+        async def perchat_menu(cb: CallbackQuery) -> None:
+            profiles = await self._db.list_chat_profiles(cb.from_user.id)
+            if profiles:
+                items = [(p["chat_ref"], f"{p['chat_ref']} · {p['updated_at'][:16]}")
+                         for p in profiles]
+                await self._safe_edit(  # type: ignore[arg-type]
+                    cb.message, texts.CHAT_PROFILE_MENU, kb.chat_profile_list(items),
+                )
+            else:
+                if not await self._require_userbot(cb.message):  # type: ignore[arg-type]
+                    await cb.answer()
+                    return
+                dialogs = await self._list_dialogs()
+                await self._safe_edit(  # type: ignore[arg-type]
+                    cb.message, texts.CHAT_PROFILE_MENU, kb.dialogs_perchat(dialogs),
+                )
+            await cb.answer()
+
+        @r.callback_query(F.data.startswith("cp:make:"))
+        @error_guard
+        async def cp_make(cb: CallbackQuery) -> None:
+            if not await self._require_userbot(cb.message):  # type: ignore[arg-type]
+                await cb.answer()
+                return
+            ref = cb.data.split(":", 2)[2]
+            key = await self._db.get_active_key(cb.from_user.id)
+            if key is None:
+                await cb.message.answer(texts.ERR_NO_ACTIVE_KEY)  # type: ignore[union-attr]
+                await cb.answer()
+                return
+            llm = create_client(
+                provider=key["provider"], base_url=key["base_url"],
+                api_key=key["api_key"], model=key["model"],
+                timeout=self._config.llm_timeout,
+            )
+            assert self._userbot.client is not None
+            await cb.answer()  # зняти спінер одразу
+            status = await cb.message.answer(  # type: ignore[union-attr]
+                texts.ANALYSIS_STARTED.format(limit=self._config.analysis_limit),
+            )
+            try:
+                profile = await generate_chat_profile(
+                    self._userbot.client, llm, ref,
+                    limit=self._config.analysis_limit,
+                )
+                await self._db.save_chat_profile(cb.from_user.id, ref, profile)
+                title = ref
+                try:
+                    entity = await self._userbot.client.get_entity(int(ref) if ref.isdigit() or ref.startswith("-") else ref)
+                    title = getattr(entity, "first_name", None) or getattr(entity, "title", None) or ref
+                except Exception:  # noqa: BLE001
+                    logger.debug("Не вдалося отримати назву чату %s", ref, exc_info=True)
+                await status.edit_text(texts.CHAT_PROFILE_DONE.format(title=html.escape(title)))
+            except ValueError as exc:
+                await status.edit_text(f"⚠️ {exc}")
+            except Exception:
+                logger.exception("Помилка генерації пер-чат профілю")
+                await status.edit_text(texts.ERR_GENERIC)
+
+        @r.callback_query(F.data.startswith("cp:show:"))
+        @error_guard
+        async def cp_show(cb: CallbackQuery) -> None:
+            ref = cb.data.split(":", 2)[2]
+            profile = await self._db.get_chat_profile(cb.from_user.id, ref)
+            if not profile:
+                await cb.answer(texts.CHAT_PROFILE_EMPTY, show_alert=True)
+                return
+            if len(profile) > 3500:
+                profile = profile[:3500] + "…"
+            await cb.message.answer(  # type: ignore[union-attr]
+                texts.CHAT_PROFILE_SHOW_HEADER.format(
+                    title=html.escape(ref), profile=html.escape(profile),
+                ),
+            )
+            await cb.answer()
+
+        @r.callback_query(F.data.startswith("cp:del:"))
+        @error_guard
+        async def cp_del(cb: CallbackQuery) -> None:
+            ref = cb.data.split(":", 2)[2]
+            await self._db.delete_chat_profile(cb.from_user.id, ref)
+            await cb.answer(texts.CHAT_PROFILE_DELETED, show_alert=True)
+            profiles = await self._db.list_chat_profiles(cb.from_user.id)
+            items = [(p["chat_ref"], f"{p['chat_ref']} · {p['updated_at'][:16]}")
+                     for p in profiles]
+            await self._safe_edit_markup(  # type: ignore[arg-type]
+                cb.message, kb.chat_profile_list(items),
+            )
 
         # ------------------------------------------------------ нагадування та журнал Q&A
 
