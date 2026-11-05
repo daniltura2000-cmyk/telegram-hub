@@ -174,6 +174,7 @@ class ControlBot:
         self._userbot = userbot
         self._pending_clients: dict[int, TelegramClient] = {}
         self._qr_tasks: dict[int, asyncio.Task[None]] = {}
+        self._entity_cache: dict[str, Any] = {}  # chat_ref -> InputPeer з get_dialogs
         self.router = Router(name="control")
         admin = AdminFilter(config.admin_ids)
         self.router.message.filter(admin)
@@ -219,8 +220,23 @@ class ControlBot:
         for dialog in dialogs:
             title = (dialog.name or "Без назви")[:40]
             chat_id = dialog.id
+            # кешуємо input_entity: get_entity(рядок-ID) падає, якщо сутності
+            # немає в кеші сесії, а свіжі get_dialogs їх гарантовано мають
+            try:
+                self._entity_cache[str(chat_id)] = await dialog.get_input_entity()
+            except Exception:  # noqa: BLE001 — фолбек на get_entity в місці виклику
+                logger.debug("Не вдалося кешувати input_entity для %s", chat_id, exc_info=True)
             result.append((chat_id, f"{title} ({chat_id})", str(chat_id)))
         return result
+
+    async def _resolve_chat_ref(self, ref: str) -> Any:
+        """Перетворити рядок-референс на те, що iter_messages приймає надійно."""
+        client = self._userbot.client
+        assert client is not None
+        cached = self._entity_cache.get(ref)
+        if cached is not None:
+            return cached
+        return await client.get_entity(int(ref) if ref.lstrip("-").isdigit() else ref)
 
     async def _run_style_analysis(self, user_id: int, chat_refs: list[str],
                                   status_msg: Message) -> None:
@@ -235,12 +251,25 @@ class ControlBot:
             timeout=self._config.llm_timeout,
         )
         assert self._userbot.client is not None
+        resolved: list[Any] = []
+        resolved_refs: list[str] = []
+        failed: list[str] = []
+        for ref in chat_refs:
+            try:
+                resolved.append(await self._resolve_chat_ref(ref))
+                resolved_refs.append(ref)
+            except Exception:  # noqa: BLE001 — окремий чат не знайдено, збираємо решту
+                logger.warning("Чат %s недоступний для аналізу", ref, exc_info=True)
+                failed.append(ref)
+        if not resolved:
+            await status_msg.answer(texts.ERR_GENERIC)
+            return
         profile = await generate_style_profile(
-            self._userbot.client, llm, chat_refs,
+            self._userbot.client, llm, resolved,
             limit_per_chat=self._config.analysis_limit,
         )
         await self._db.set_style_profile(user_id, profile)
-        for ref in chat_refs:
+        for ref in resolved_refs:
             await self._db.mark_analyzed(user_id, ref)
         await status_msg.answer(texts.ANALYSIS_DONE)
 
@@ -894,13 +923,13 @@ class ControlBot:
             )
             try:
                 profile = await generate_chat_profile(
-                    self._userbot.client, llm, ref,
+                    self._userbot.client, llm, await self._resolve_chat_ref(ref),
                     limit=self._config.analysis_limit,
                 )
                 await self._db.save_chat_profile(cb.from_user.id, ref, profile)
                 title = ref
                 try:
-                    entity = await self._userbot.client.get_entity(int(ref) if ref.isdigit() or ref.startswith("-") else ref)
+                    entity = await self._resolve_chat_ref(ref)
                     title = getattr(entity, "first_name", None) or getattr(entity, "title", None) or ref
                 except Exception:  # noqa: BLE001
                     logger.debug("Не вдалося отримати назву чату %s", ref, exc_info=True)
