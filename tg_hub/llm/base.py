@@ -68,4 +68,10 @@ class BaseLLMClient(abc.ABC):
             if attempt < self.max_retries - 1:
                 await asyncio.sleep(self.backoff_base * (2 ** attempt))
 
+        if last_error.startswith("HTTP 429"):
+            raise LLMError(
+                "перевищено ліміт запитів або вичерпано квоту провайдера (HTTP 429). "
+                "Для OpenAI перевірте кредити на platform.openai.com; "
+                "розгляньте безкоштовний Gemini (aistudio.google.com) як запасний ключ."
+            )
         raise LLMError(f"LLM недоступний після {self.max_retries} спроб: {last_error}")

@@ -27,6 +27,7 @@ from . import texts
 from .config import Config
 from .db import Database
 from .llm import create_client
+from .llm.probe import ProbeError, probe_key
 from .persona import DEFAULT_BASE_PROMPT, generate_style_profile
 from .userbot import Userbot
 
@@ -126,6 +127,12 @@ class ControlBot:
         self._register_handlers()
 
     # ------------------------------------------------------------------ утиліти
+
+    async def _maybe_autoset_active(self, user_id: int, key_id: int) -> None:
+        """Перший доданий ключ автоматично стає активним."""
+        keys = await self._db.list_llm_keys(user_id)
+        if all(not k["is_active"] for k in keys):
+            await self._db.set_active_key(user_id, key_id)
 
     async def _require_userbot(self, event: Message | CallbackQuery) -> bool:
         if not self._userbot.connected:
@@ -228,12 +235,19 @@ class ControlBot:
         @r.callback_query(F.data.startswith("keyprov:"))
         @error_guard
         async def key_provider_chosen(cb: CallbackQuery, state: FSMContext) -> None:
-            provider = cb.data.split(":", 1)[1]
-            await state.set_state(ApiKeyStates.base_url if provider == "openai" else ApiKeyStates.api_key)
+            parts = cb.data.split(":", 2)  # keyprov:<provider>[:<base_url>]
+            provider = parts[1]
             await state.update_data(provider=provider)
-            if provider == "openai":
+            if len(parts) == 3 and parts[2]:
+                # пресет: base_url вже відомий → одразу ключ
+                await state.update_data(base_url=parts[2].rstrip("/"))
+                await state.set_state(ApiKeyStates.api_key)
+                await cb.message.edit_text(texts.ASK_API_KEY)  # type: ignore[union-attr]
+            elif provider == "openai":
+                await state.set_state(ApiKeyStates.base_url)
                 await cb.message.edit_text(texts.ASK_BASE_URL)  # type: ignore[union-attr]
             else:
+                await state.set_state(ApiKeyStates.api_key)
                 await cb.message.edit_text(texts.ASK_API_KEY)  # type: ignore[union-attr]
             await cb.answer()
 
@@ -261,8 +275,57 @@ class ControlBot:
                 await message.answer("⚠️ Ключ виглядає занадто коротким. Спробуйте ще раз.")
                 return
             await state.update_data(api_key=api_key)
-            await state.set_state(ApiKeyStates.model)
-            await message.answer(texts.ASK_MODEL)
+            data = await state.get_data()
+            wait = await message.answer("⏳ Перевіряю ключ і збираю доступні моделі…")
+            try:
+                models = await probe_key(data["provider"], data.get("base_url", ""), api_key)
+            except ProbeError as exc:
+                await wait.delete()
+                await message.answer(str(exc))
+                return  # лишаємося в стані api_key — можна ввести інший ключ
+            except Exception:
+                logger.exception("probe_key мережева помилка")
+                await wait.delete()
+                await message.answer(
+                    "⚠️ Не вдалося зв'язатися з провайдером для перевірки ключа. "
+                    "Спробуйте ще раз або перевірте інтернет.",
+                )
+                return
+            await wait.delete()
+            await state.update_data(models=models)
+            await message.answer(
+                texts.MODELS_FOUND.format(count=len(models)),
+                reply_markup=kb.model_choice(models),
+            )
+
+        @r.callback_query(F.data.startswith("keymodel:"))
+        @error_guard
+        async def key_model_chosen(cb: CallbackQuery, state: FSMContext) -> None:
+            chosen = cb.data.split(":", 1)[1]
+            if chosen == "__manual__":
+                await state.set_state(ApiKeyStates.model)
+                await cb.message.answer(texts.ASK_MODEL)  # type: ignore[union-attr]
+                await cb.answer()
+                return
+            data = await state.get_data()
+            key_id = await self._db.add_llm_key(
+                user_id=cb.from_user.id,
+                provider=data["provider"],
+                label=data.get("base_url", ""),
+                base_url=data.get("base_url"),
+                api_key=data["api_key"],
+                model=chosen,
+            )
+            await state.clear()
+            await self._maybe_autoset_active(cb.from_user.id, key_id)
+            provider_name = {"openai": "OpenAI", "anthropic": "Anthropic", "google": "Google"}.get(
+                data["provider"], data["provider"]
+            )
+            await cb.message.answer(  # type: ignore[union-attr]
+                texts.KEY_ADDED_ACTIVE.format(key_id=key_id, provider=provider_name, model=chosen),
+                reply_markup=kb.main_menu(),
+            )
+            await cb.answer()
 
         @r.message(ApiKeyStates.model)
         @error_guard
@@ -281,16 +344,13 @@ class ControlBot:
                 model=model,
             )
             await state.clear()
+            await self._maybe_autoset_active(message.from_user.id, key_id)
             provider_name = {"openai": "OpenAI", "anthropic": "Anthropic", "google": "Google"}.get(
                 data["provider"], data["provider"]
             )
             await message.answer(
-                texts.KEY_ADDED.format(key_id=key_id, provider=provider_name),
+                texts.KEY_ADDED_ACTIVE.format(key_id=key_id, provider=provider_name, model=model),
                 reply_markup=kb.main_menu(),
-            )
-            await message.answer(
-                texts.API_KEYS_MENU,
-                reply_markup=kb.key_list(await self._db.list_llm_keys(message.from_user.id)),
             )
 
         @r.callback_query(F.data == "key:list")

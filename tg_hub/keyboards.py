@@ -33,11 +33,34 @@ def api_keys_menu() -> InlineKeyboardMarkup:
 
 def provider_choice() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=texts.PROVIDER_OPENAI, callback_data="keyprov:openai")],
-        [InlineKeyboardButton(text=texts.PROVIDER_ANTHROPIC, callback_data="keyprov:anthropic")],
         [InlineKeyboardButton(text=texts.PROVIDER_GOOGLE, callback_data="keyprov:google")],
+        [InlineKeyboardButton(text="🟢 OpenAI", callback_data="keyprov:openai:https://api.openai.com/v1")],
+        [InlineKeyboardButton(text="🟣 OpenRouter", callback_data="keyprov:openai:https://openrouter.ai/api/v1")],
+        [InlineKeyboardButton(text="🟡 DeepSeek", callback_data="keyprov:openai:https://api.deepseek.com/v1")],
+        [InlineKeyboardButton(text="🟠 Anthropic", callback_data="keyprov:anthropic")],
+        [InlineKeyboardButton(text="⚙️ Інший OpenAI-сумісний (свій URL)", callback_data="keyprov:openai")],
         *back_button_row(),
     ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def model_choice(models: list[str]) -> InlineKeyboardMarkup:
+    """Вибір моделі зі списку, отриманого від провайдера."""
+    rows: list[list[InlineKeyboardButton]] = []
+    current: list[InlineKeyboardButton] = []
+    for name in models[:30]:
+        current.append(InlineKeyboardButton(
+            text=name, callback_data=f"keymodel:{name}",
+        ))
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([InlineKeyboardButton(
+        text="⌨️ Інша модель (ввести вручну)", callback_data="keymodel:__manual__",
+    )])
+    rows.extend(back_button_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

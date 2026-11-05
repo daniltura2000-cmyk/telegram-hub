@@ -29,7 +29,12 @@ API_KEYS_MENU = (
 )
 BTN_KEY_ADD = "➕ Додати ключ"
 BTN_KEY_LIST = "📋 Список ключів"
-CHOOSE_PROVIDER = "Оберіть провайдера:"
+CHOOSE_PROVIDER = (
+    "Оберіть провайдера — ключ перевіриться одразу, і моделі покажу списком:\n\n"
+    "💡 Безкоштовний варіант — Google Gemini: "
+    "<a href=\"https://aistudio.google.com/app/apikey\">aistudio.google.com/app/apikey</a> "
+    "(кнопка «Get API key», безкоштовно)."
+)
 PROVIDER_OPENAI = "🟢 OpenAI-сумісний"
 PROVIDER_ANTHROPIC = "🟠 Anthropic"
 PROVIDER_GOOGLE = "🔵 Google Gemini"
@@ -65,6 +70,11 @@ ASK_MODEL = (
     "• Anthropic: <code>claude-sonnet-4-20250514</code>"
 )
 KEY_ADDED = "✅ Ключ #{key_id} додано ({provider}). Активний: ні."
+KEY_ADDED_ACTIVE = "✅ Ключ #{key_id} додано ({provider}) — модель {model}. Ключ активний ⭐"
+MODELS_FOUND = (
+    "✅ Ключ працює! Доступних моделей: {count}.\n\nОберіть модель кнопкою нижче "
+    "(або введіть назву вручну):"
+)
 KEY_LIST_EMPTY = "Ключів ще немає."
 KEY_ACTIVATE_DONE = "✅ Ключ #{key_id} тепер активний."
 KEY_DELETED = "🗑 Ключ #{key_id} видалено."
