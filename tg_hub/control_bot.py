@@ -6,16 +6,19 @@
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import segno
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import BaseFilter
+from aiogram.filters import BaseFilter, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telethon import TelegramClient
 from telethon import errors as telethon_errors
 
@@ -49,6 +52,11 @@ class ConnectStates(StatesGroup):
     phone = State()
     code = State()
     password = State()
+
+
+class QrStates(StatesGroup):
+    api_id = State()
+    api_hash = State()
 
 
 class PromptStates(StatesGroup):
@@ -110,6 +118,7 @@ class ControlBot:
         self._db = db
         self._userbot = userbot
         self._pending_clients: dict[int, TelegramClient] = {}
+        self._qr_tasks: dict[int, asyncio.Task[None]] = {}
         self.router = Router(name="control")
         admin = AdminFilter(config.admin_ids)
         self.router.message.filter(admin)
@@ -161,6 +170,13 @@ class ControlBot:
 
     def _register_handlers(self) -> None:
         r = self.router
+
+        @r.message(CommandStart())
+        @error_guard
+        async def start(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            await self._db.ensure_user(message.from_user.id)
+            await message.answer(texts.WELCOME, reply_markup=kb.main_menu())
 
         @r.message(F.text == texts.BTN_BACK)
         @error_guard
@@ -226,7 +242,12 @@ class ControlBot:
         async def key_base_url(message: Message, state: FSMContext) -> None:
             url = (message.text or "").strip().rstrip("/")
             if not url.startswith(("http://", "https://")):
-                await message.answer("⚠️ URL має починатися з http:// або https://.")
+                url = f"https://{url}"  # користувач забув схему — підставляємо
+            if "." not in url.split("//", 1)[-1]:
+                await message.answer(
+                    "⚠️ Це не схоже на URL. Надішліть адресу, наприклад "
+                    "https://api.openai.com/v1",
+                )
                 return
             await state.update_data(base_url=url)
             await state.set_state(ApiKeyStates.api_key)
@@ -374,7 +395,27 @@ class ControlBot:
                 device_model="TelegramHub",
             )
             await client.connect()
-            await client.send_code_request(phone)
+            try:
+                await client.send_code_request(phone)
+            except telethon_errors.ApiIdInvalidError:
+                await client.disconnect()
+                self._pending_clients.pop(user_id, None)
+                await state.clear()
+                await message.answer(
+                    "❌ Telegram відхилив пару api_id/api_hash — значення недійсні.\n\n"
+                    "Перевірте на my.telegram.org/apps і почніть заново: "
+                    "📱 Підключити акаунт → 🔌 Підключити.",
+                )
+                return
+            except telethon_errors.FloodWaitError as exc:
+                await client.disconnect()
+                self._pending_clients.pop(user_id, None)
+                await state.clear()
+                await message.answer(
+                    f"⏳ Telegram обмежив частоту запитів коду. "
+                    f"Спробуйте ще раз через {exc.seconds // 60 + 1} хв.",
+                )
+                return
             self._pending_clients[user_id] = client
             await state.update_data(phone=phone)
             await state.set_state(ConnectStates.code)
@@ -423,6 +464,46 @@ class ControlBot:
                     await message.answer("⚠️ Невірний пароль. Спробуйте ще раз.")
                     return
             await self._finish_connect(message, state)
+
+        # ------------------------------------------------------ вхід через QR
+
+        @r.callback_query(F.data == "connect:qr")
+        @error_guard
+        async def connect_qr(cb: CallbackQuery, state: FSMContext) -> None:
+            await state.clear()
+            account = await self._db.get_account(cb.from_user.id)
+            if account and account.get("api_id") and account.get("api_hash"):
+                await cb.message.answer(texts.QR_USING_SAVED)  # type: ignore[union-attr]
+                await self._start_qr_login(
+                    cb.message, state, cb.from_user.id,
+                    int(account["api_id"]), str(account["api_hash"]),
+                )
+            else:
+                await state.set_state(QrStates.api_id)
+                await cb.message.answer(texts.ASK_API_ID)  # type: ignore[union-attr]
+            await cb.answer()
+
+        @r.message(QrStates.api_id)
+        @error_guard
+        async def qr_api_id(message: Message, state: FSMContext) -> None:
+            raw = (message.text or "").strip()
+            if not raw.isdigit():
+                await message.answer(texts.ERR_INVALID_API_ID)
+                return
+            await state.update_data(api_id=int(raw))
+            await state.set_state(QrStates.api_hash)
+            await message.answer(texts.ASK_API_HASH)
+
+        @r.message(QrStates.api_hash)
+        @error_guard
+        async def qr_api_hash(message: Message, state: FSMContext) -> None:
+            api_hash = (message.text or "").strip()
+            if len(api_hash) < 30:
+                await message.answer("⚠️ api_hash виглядає некоректно (зазвичай 32 символи).")
+                return
+            data = await state.get_data()
+            api_id = int(data["api_id"])
+            await self._start_qr_login(message, state, message.from_user.id, api_id, api_hash)
 
         # ------------------------------------------------------ промпт
 
@@ -783,7 +864,145 @@ class ControlBot:
         async def noop(cb: CallbackQuery) -> None:
             await cb.answer()
 
+    # ------------------------------------------------------------------ вхід через QR
+
+    async def _start_qr_login(self, message: Message, state: FSMContext,
+                              user_id: int, api_id: int, api_hash: str) -> None:
+        """Створити клієнт, запросити QR-логін і запустити фонове очікування."""
+        old_task = self._qr_tasks.pop(user_id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        old_client = self._pending_clients.pop(user_id, None)
+        if old_client is not None:
+            try:
+                await old_client.disconnect()
+            except Exception:  # noqa: BLE001
+                logger.debug("Не вдалося від'єднати старий клієнт", exc_info=True)
+
+        self._config.sessions_dir.mkdir(parents=True, exist_ok=True)
+        session_path = self._config.sessions_dir / f"{user_id}.session"
+        client = TelegramClient(
+            str(session_path), api_id, api_hash, device_model="TelegramHub",
+        )
+        try:
+            await client.connect()
+            qr = await client.qr_login()
+        except telethon_errors.ApiIdInvalidError:
+            await client.disconnect()
+            await state.clear()
+            await message.answer(
+                "❌ Telegram відхилив пару api_id/api_hash — значення недійсні.\n\n"
+                "Перевірте на my.telegram.org/apps і почніть заново.",
+            )
+            return
+        except Exception:
+            await client.disconnect()
+            await state.clear()
+            logger.exception("QR-логін не вдався")
+            await message.answer(texts.ERR_GENERIC)
+            return
+
+        self._pending_clients[user_id] = client
+        await state.update_data(api_id=api_id, api_hash=api_hash)
+
+        qr_path = self._config.sessions_dir / f"qr_{user_id}.png"
+        segno.make(qr.url).save(str(qr_path), scale=8, border=2)
+        token_part = qr.url.split("token=", 1)[-1]
+        rows = [[InlineKeyboardButton(
+            text="🔓 Підтвердити вхід",
+            url=f"https://t.me/login?token={token_part}",
+        )]]
+        try:
+            await message.answer_photo(
+                FSInputFile(qr_path),
+                caption=texts.QR_READY,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        finally:
+            qr_path.unlink(missing_ok=True)
+
+        task = asyncio.create_task(self._qr_watch(user_id, client, message, state, qr))
+        self._qr_tasks[user_id] = task
+
+    async def _qr_watch(self, user_id: int, client: TelegramClient, message: Message,
+                        state: FSMContext, qr: Any) -> None:
+        """Фоново чекає підтвердження QR-логіну (до ~4 хв, з оновленням токена)."""
+        try:
+            confirmed = False
+            for _ in range(8):  # 8 × 30 с ≈ 4 хв
+                try:
+                    await qr.wait(timeout=30)
+                except asyncio.TimeoutError:
+                    try:
+                        await qr.recreate()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Не вдалося оновити QR-токен")
+                        break
+                    continue
+                confirmed = True
+                break
+            self._qr_tasks.pop(user_id, None)
+            if not confirmed and not await client.is_user_authorized():
+                await client.disconnect()
+                self._pending_clients.pop(user_id, None)
+                await state.clear()
+                await message.answer(texts.QR_TIMEOUT)
+                return
+            await self._finish_connect(message, state, client=client)
+        except telethon_errors.SessionPasswordNeededError:
+            self._qr_tasks.pop(user_id, None)
+            self._pending_clients[user_id] = client
+            await state.set_state(ConnectStates.password)
+            await message.answer(texts.ASK_PASSWORD)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._qr_tasks.pop(user_id, None)
+            self._pending_clients.pop(user_id, None)
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.exception("Помилка очікування QR-логіну")
+            try:
+                await message.answer(texts.ERR_GENERIC)
+            except Exception:  # noqa: BLE001
+                pass
+
     # ------------------------------------------------------------------ допоміжне
+
+    async def _finish_connect(self, message: Message, state: FSMContext,
+                              client: TelegramClient | None = None) -> None:
+        """Зберегти акаунт, закрити тимчасовий клієнт і запустити userbot."""
+        data = await state.get_data()
+        user_id = message.from_user.id
+        client = client or self._pending_clients.get(user_id)
+        if client is None:
+            await state.clear()
+            await message.answer(texts.CONNECT_FAILED.format(reason="сесію втрачено"),
+                                 reply_markup=kb.main_menu())
+            return
+        me = await client.get_me()
+        phone = getattr(me, "phone", None) or str(data.get("phone", ""))
+        api_id = int(data["api_id"])
+        api_hash = str(data["api_hash"])
+        await self._db.save_account(user_id, api_id, api_hash, phone)
+        await state.clear()
+        self._pending_clients.pop(user_id, None)
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            logger.debug("Не вдалося від'єднати клієнт підключення", exc_info=True)
+        ok = await self._userbot.start()
+        if ok:
+            await message.answer(
+                texts.CONNECT_SUCCESS.format(user_id=user_id), reply_markup=kb.main_menu(),
+            )
+        else:
+            await message.answer(
+                texts.CONNECT_FAILED.format(reason="userbot не запустився"),
+                reply_markup=kb.main_menu(),
+            )
 
     async def _refresh_autoreply_menu(self, cb: CallbackQuery) -> None:
         s = await self._db.get_settings(cb.from_user.id)

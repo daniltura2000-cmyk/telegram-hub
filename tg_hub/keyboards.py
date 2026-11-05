@@ -69,6 +69,7 @@ def key_list(keys: list[dict]) -> InlineKeyboardMarkup:
 def connect_menu() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=texts.BTN_CONNECT_START, callback_data="connect:start")],
+        [InlineKeyboardButton(text=texts.BTN_QR_LOGIN, callback_data="connect:qr")],
         *back_button_row(),
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
