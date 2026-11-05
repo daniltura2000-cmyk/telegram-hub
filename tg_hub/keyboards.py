@@ -14,6 +14,7 @@ def main_menu() -> ReplyKeyboardMarkup:
         [KeyboardButton(text=texts.BTN_API_KEYS), KeyboardButton(text=texts.BTN_CONNECT)],
         [KeyboardButton(text=texts.BTN_PROMPT), KeyboardButton(text=texts.BTN_STYLE)],
         [KeyboardButton(text=texts.BTN_AUTOREPLY), KeyboardButton(text=texts.BTN_STATUS)],
+        [KeyboardButton(text=texts.BTN_REMINDERS), KeyboardButton(text=texts.BTN_PROFILES)],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -99,11 +100,91 @@ def connect_menu() -> InlineKeyboardMarkup:
 
 
 def prompt_menu() -> InlineKeyboardMarkup:
+    """Меню «📝 Промпт»: дві частини — короткий промпт і база знань."""
+    rows = [
+        [InlineKeyboardButton(text=texts.BTN_PROMPT_SHORT, callback_data="prompt:short")],
+        [InlineKeyboardButton(text=texts.BTN_KB, callback_data="kb:open")],
+        *back_button_row(),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def prompt_edit_menu() -> InlineKeyboardMarkup:
+    """Керування коротким промптом: змінити / скинути."""
     rows = [
         [InlineKeyboardButton(text=texts.BTN_PROMPT_EDIT, callback_data="prompt:edit")],
         [InlineKeyboardButton(text=texts.BTN_PROMPT_RESET, callback_data="prompt:reset")],
         *back_button_row(),
     ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=texts.BTN_KB_ADD, callback_data="kb:add")],
+        [InlineKeyboardButton(text=texts.BTN_KB_LIST, callback_data="kb:list")],
+        [InlineKeyboardButton(text=texts.BTN_KB_EXPORT, callback_data="kb:export")],
+        *back_button_row(),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_entries_list(entries: list[dict]) -> InlineKeyboardMarkup:
+    """Список записів бази знань: перегляд (кнопка з назвою) + видалення."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for entry in entries:
+        title = (entry["title"] or "Без назви")[:40]
+        rows.append([
+            InlineKeyboardButton(text=f"📄 {title}", callback_data=f"kb:view:{entry['id']}"),
+            InlineKeyboardButton(text=texts.BTN_REM_DELETE, callback_data=f"kb:del:{entry['id']}"),
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton(text="—", callback_data="noop")])
+    rows.append([InlineKeyboardButton(text=texts.BTN_KB_ADD, callback_data="kb:add")])
+    rows.extend(back_button_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def journal_menu(reminders: list[dict]) -> InlineKeyboardMarkup:
+    """Меню «🔔 Нагадування»: додати нагадування, список активних, очистити журнал."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text=texts.BTN_REMINDER_ADD, callback_data="jr:add")],
+    ]
+    for item in reminders:
+        label = f"🗑 {item['due_at']} · {(item['text'] or '')[:40]}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"rem:del:{item['id']}")])
+    rows.append([InlineKeyboardButton(text=texts.BTN_JOURNAL_CLEAR, callback_data="jr:clear")])
+    rows.extend(back_button_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def profiles_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=texts.BTN_PROFILE_SAVE, callback_data="prof:save")],
+        [InlineKeyboardButton(text=texts.BTN_PROFILE_LIST, callback_data="prof:list")],
+        *back_button_row(),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def profile_list(profiles: list[dict], active_name: str) -> InlineKeyboardMarkup:
+    """Список профілів: «✅ Увімкнути #N» і «🗑 Видалити #N» для кожного."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for profile in profiles:
+        is_active = profile["name"] == active_name
+        rows.append([
+            InlineKeyboardButton(
+                text=f"✅ Увімкнути #{profile['id']}{texts.PROFILE_ACTIVE_MARK if is_active else ''}",
+                callback_data=f"prof:apply:{profile['id']}",
+            ),
+            InlineKeyboardButton(
+                text=f"🗑 #{profile['id']}",
+                callback_data=f"prof:del:{profile['id']}",
+            ),
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton(text="—", callback_data="noop")])
+    rows.extend(back_button_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

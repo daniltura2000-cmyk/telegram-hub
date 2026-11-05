@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import html
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -18,7 +20,14 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import BaseFilter, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from telethon import TelegramClient
 from telethon import errors as telethon_errors
 
@@ -29,6 +38,7 @@ from .db import Database
 from .llm import create_client
 from .llm.probe import ProbeError, probe_key, verify_model
 from .persona import DEFAULT_BASE_PROMPT, generate_style_profile
+from .reminders import format_due, parse_reminder_time, serialize_snapshot
 from .userbot import Userbot
 
 logger = logging.getLogger(__name__)
@@ -70,6 +80,19 @@ class ListStates(StatesGroup):
 
 class NumberStates(StatesGroup):
     waiting = State()
+
+
+class RemindStates(StatesGroup):
+    text = State()
+    time = State()
+
+
+class KbStates(StatesGroup):
+    content = State()
+
+
+class ProfileStates(StatesGroup):
+    name = State()
 
 
 class AdminFilter(BaseFilter):
@@ -599,17 +622,28 @@ class ControlBot:
             api_id = int(data["api_id"])
             await self._start_qr_login(message, state, message.from_user.id, api_id, api_hash)
 
-        # ------------------------------------------------------ промпт
+        # ------------------------------------------------------ промпт (дві частини)
 
         @r.message(F.text == texts.BTN_PROMPT)
         @error_guard
         async def prompt_menu(message: Message, state: FSMContext) -> None:
             await state.clear()
             await self._db.ensure_user(message.from_user.id)
-            prompts = await self._db.get_prompts(message.from_user.id)
+            await message.answer(texts.PROMPT_SPLIT_MENU, reply_markup=kb.prompt_menu())
+
+        @r.callback_query(F.data == "prompt:short")
+        @error_guard
+        async def prompt_short(cb: CallbackQuery, state: FSMContext) -> None:
+            await state.clear()
+            await self._db.ensure_user(cb.from_user.id)
+            prompts = await self._db.get_prompts(cb.from_user.id)
             current = prompts["base_prompt"] or DEFAULT_BASE_PROMPT
             shown = current if len(current) <= 1500 else current[:1500] + "…"
-            await message.answer(texts.PROMPT_MENU.format(prompt=shown), reply_markup=kb.prompt_menu())
+            await cb.message.answer(  # type: ignore[union-attr]
+                texts.PROMPT_MENU.format(prompt=shown),
+                reply_markup=kb.prompt_edit_menu(),
+            )
+            await cb.answer()
 
         @r.callback_query(F.data == "prompt:edit")
         @error_guard
@@ -746,6 +780,259 @@ class ControlBot:
             await cb.message.answer(texts.ANALYSIS_STARTED.format(limit=self._config.analysis_limit))  # type: ignore[union-attr]
             await self._run_style_analysis(cb.from_user.id, refs, cb.message)  # type: ignore[arg-type]
             await cb.answer()
+
+        # ------------------------------------------------------ нагадування та журнал Q&A
+
+        @r.message(F.text == texts.BTN_REMINDERS)
+        @error_guard
+        async def reminders_menu(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            await self._send_journal_menu(message)
+
+        @r.callback_query(F.data == "jr:clear")
+        @error_guard
+        async def jr_clear(cb: CallbackQuery) -> None:
+            await self._db.clear_qa_journal(cb.from_user.id)
+            await cb.answer(texts.JOURNAL_CLEARED, show_alert=True)
+            await self._refresh_journal_menu(cb)
+
+        @r.callback_query(F.data == "jr:add")
+        @error_guard
+        async def jr_add(cb: CallbackQuery, state: FSMContext) -> None:
+            await state.set_state(RemindStates.text)
+            await cb.message.answer(texts.ASK_REMIND_TEXT)  # type: ignore[union-attr]
+            await cb.answer()
+
+        @r.message(RemindStates.text)
+        @error_guard
+        async def remind_text_input(message: Message, state: FSMContext) -> None:
+            text = (message.text or "").strip()
+            if not text:
+                await message.answer(texts.ASK_REMIND_TEXT)
+                return
+            await state.update_data(remind_text=text)
+            await state.set_state(RemindStates.time)
+            await message.answer(texts.ASK_REMIND_TIME)
+
+        @r.message(RemindStates.time)
+        @error_guard
+        async def remind_time_input(message: Message, state: FSMContext) -> None:
+            raw = (message.text or "").strip()
+            due = parse_reminder_time(raw)
+            if due is None:
+                await message.answer(texts.REMINDER_BAD_TIME)
+                return
+            if due <= datetime.now():
+                await message.answer(texts.REMINDER_BAD_PAST)
+                return
+            data = await state.get_data()
+            text = str(data.get("remind_text", "")).strip() or "Нагадування"
+            due_iso = due.isoformat(timespec="seconds")
+            await self._db.add_reminder(message.from_user.id, due_iso, text)
+            await state.clear()
+            await message.answer(
+                texts.REMINDER_ADDED.format(due_at=format_due(due_iso)),
+                reply_markup=kb.main_menu(),
+            )
+
+        @r.callback_query(F.data.startswith("rem:del:"))
+        @error_guard
+        async def rem_del(cb: CallbackQuery) -> None:
+            reminder_id = int(cb.data.split(":")[2])
+            await self._db.delete_reminder(cb.from_user.id, reminder_id)
+            await cb.answer(texts.REMINDER_DELETED, show_alert=True)
+            await self._refresh_journal_menu(cb)
+
+        # ------------------------------------------------------ база знань
+
+        @r.callback_query(F.data == "kb:open")
+        @error_guard
+        async def kb_open(cb: CallbackQuery, state: FSMContext) -> None:
+            await state.clear()
+            text = await self._kb_menu_text(cb.from_user.id)
+            try:
+                await cb.message.edit_text(text, reply_markup=kb.kb_menu())  # type: ignore[union-attr]
+            except TelegramAPIError:
+                await cb.message.answer(text, reply_markup=kb.kb_menu())  # type: ignore[union-attr]
+            await cb.answer()
+
+        @r.callback_query(F.data == "kb:add")
+        @error_guard
+        async def kb_add(cb: CallbackQuery, state: FSMContext) -> None:
+            await state.set_state(KbStates.content)
+            await state.update_data(kb_buffer=[])
+            await cb.message.answer(texts.ASK_KB_CONTENT)  # type: ignore[union-attr]
+            await cb.answer()
+
+        @r.message(KbStates.content, F.text == "/done")
+        @error_guard
+        async def kb_done(message: Message, state: FSMContext) -> None:
+            data = await state.get_data()
+            buffer: list[str] = list(data.get("kb_buffer", []))
+            content = "\n".join(buffer).strip()
+            if not content:
+                await message.answer(texts.KB_EMPTY_BUFFER)
+                return
+            title = content.splitlines()[0].strip()[:60]
+            await self._db.add_kb_entry(message.from_user.id, title, content)
+            await state.clear()
+            await message.answer(
+                texts.KB_SAVED.format(title=html.escape(title), chars=len(content)),
+                reply_markup=kb.main_menu(),
+            )
+
+        @r.message(KbStates.content)
+        @error_guard
+        async def kb_chunk(message: Message, state: FSMContext) -> None:
+            text = (message.text or "").strip()
+            if not text:
+                return
+            total = await self._db.kb_total_chars(message.from_user.id)
+            if total + len(text) > texts.KB_MAX_CHARS:
+                await message.answer(texts.KB_TOO_LONG.format(limit=texts.KB_MAX_CHARS))
+                return
+            data = await state.get_data()
+            buffer: list[str] = list(data.get("kb_buffer", []))
+            buffer.append(text)
+            await state.update_data(kb_buffer=buffer)
+            await message.answer(
+                texts.KB_CHUNK_SAVED.format(chars=len(text), total=total + len(text))
+            )
+
+        @r.callback_query(F.data == "kb:list")
+        @error_guard
+        async def kb_list(cb: CallbackQuery) -> None:
+            entries = await self._db.list_kb_entries(cb.from_user.id)
+            title, markup = self._kb_list_view(entries)
+            try:
+                await cb.message.edit_text(title, reply_markup=markup)  # type: ignore[union-attr]
+            except TelegramAPIError:
+                logger.debug("Не вдалося оновити список бази знань", exc_info=True)
+            await cb.answer()
+
+        @r.callback_query(F.data.startswith("kb:view:"))
+        @error_guard
+        async def kb_view(cb: CallbackQuery) -> None:
+            entry_id = int(cb.data.split(":")[2])
+            entry = await self._db.get_kb_entry(cb.from_user.id, entry_id)
+            if entry is None:
+                await cb.answer("Запис не знайдено", show_alert=True)
+                return
+            content = entry["content"] or ""
+            if len(content) > 3500:
+                content = content[:3500] + "…"
+            await cb.message.answer(  # type: ignore[union-attr]
+                texts.KB_ENTRY_FMT.format(
+                    title=html.escape(entry["title"] or "Без назви"),
+                    content=html.escape(content),
+                )
+            )
+            await cb.answer()
+
+        @r.callback_query(F.data.startswith("kb:del:"))
+        @error_guard
+        async def kb_del(cb: CallbackQuery) -> None:
+            entry_id = int(cb.data.split(":")[2])
+            await self._db.delete_kb_entry(cb.from_user.id, entry_id)
+            await cb.answer(texts.KB_ENTRY_DELETED, show_alert=True)
+            entries = await self._db.list_kb_entries(cb.from_user.id)
+            title, markup = self._kb_list_view(entries)
+            try:
+                await cb.message.edit_text(title, reply_markup=markup)  # type: ignore[union-attr]
+            except TelegramAPIError:
+                logger.debug("Не вдалося оновити список бази знань", exc_info=True)
+
+        @r.callback_query(F.data == "kb:export")
+        @error_guard
+        async def kb_export(cb: CallbackQuery) -> None:
+            entries = await self._db.list_kb_entries(cb.from_user.id)
+            if not entries:
+                await cb.answer(texts.KB_EXPORT_EMPTY, show_alert=True)
+                return
+            md = "\n\n".join(
+                f"## {entry['title']}\n\n{entry['content']}" for entry in entries
+            )
+            file = BufferedInputFile(md.encode("utf-8"), filename=texts.KB_EXPORT_NAME)
+            await cb.message.answer_document(file)  # type: ignore[union-attr]
+            await cb.answer()
+
+        # ------------------------------------------------------ профілі налаштувань
+
+        @r.message(F.text == texts.BTN_PROFILES)
+        @error_guard
+        async def profiles_menu(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            await self._db.ensure_user(message.from_user.id)
+            settings = await self._db.get_settings(message.from_user.id)
+            active = settings["profile_name"] or texts.PROFILE_NONE_ACTIVE
+            await message.answer(
+                texts.PROFILES_MENU.format(active=html.escape(active)),
+                reply_markup=kb.profiles_menu(),
+            )
+
+        @r.callback_query(F.data == "prof:save")
+        @error_guard
+        async def prof_save(cb: CallbackQuery, state: FSMContext) -> None:
+            await state.set_state(ProfileStates.name)
+            await cb.message.answer(texts.ASK_PROFILE_NAME)  # type: ignore[union-attr]
+            await cb.answer()
+
+        @r.message(ProfileStates.name)
+        @error_guard
+        async def prof_name(message: Message, state: FSMContext) -> None:
+            name = (message.text or "").strip()
+            if not 1 <= len(name) <= 40:
+                await message.answer(texts.PROFILE_BAD_NAME)
+                return
+            snapshot = await self._make_profile_snapshot(message.from_user.id)
+            await self._db.save_profile(
+                message.from_user.id, name, serialize_snapshot(snapshot)
+            )
+            await state.clear()
+            await message.answer(
+                texts.PROFILE_SAVED.format(name=html.escape(name)),
+                reply_markup=kb.main_menu(),
+            )
+
+        @r.callback_query(F.data == "prof:list")
+        @error_guard
+        async def prof_list(cb: CallbackQuery) -> None:
+            text, markup = await self._profiles_view(cb.from_user.id)
+            try:
+                await cb.message.edit_text(text, reply_markup=markup)  # type: ignore[union-attr]
+            except TelegramAPIError:
+                await cb.message.answer(text, reply_markup=markup)  # type: ignore[union-attr]
+            await cb.answer()
+
+        @r.callback_query(F.data.startswith("prof:apply:"))
+        @error_guard
+        async def prof_apply(cb: CallbackQuery) -> None:
+            profile_id = int(cb.data.split(":")[2])
+            profile = await self._db.get_profile(cb.from_user.id, profile_id)
+            if profile is None or not await self._db.apply_profile(cb.from_user.id, profile_id):
+                await cb.answer(texts.PROFILE_APPLY_FAILED, show_alert=True)
+                return
+            await cb.answer(
+                texts.PROFILE_APPLIED.format(name=profile["name"]), show_alert=True
+            )
+            await self._refresh_profiles_view(cb)
+
+        @r.callback_query(F.data.startswith("prof:del:"))
+        @error_guard
+        async def prof_del(cb: CallbackQuery) -> None:
+            profile_id = int(cb.data.split(":")[2])
+            profile = await self._db.get_profile(cb.from_user.id, profile_id)
+            await self._db.delete_profile(cb.from_user.id, profile_id)
+            if profile is not None:
+                await cb.answer(
+                    texts.PROFILE_DELETE_CONFIRM.format(
+                        profile_id=profile_id, name=profile["name"]
+                    ),
+                    show_alert=True,
+                )
+            else:
+                await cb.answer(texts.PROFILE_APPLY_FAILED, show_alert=True)
+            await self._refresh_profiles_view(cb)
 
         # ------------------------------------------------------ налаштування авто-відповідей
 
@@ -1048,11 +1335,121 @@ class ControlBot:
 
     # ------------------------------------------------------------------ допоміжне
 
+    async def _journal_view(self, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        """Текст і клавіатура меню «🔔 Нагадування» (журнал + список нагадувань)."""
+        entries = await self._db.list_qa_entries(user_id, limit=10)
+        if entries:
+            body = "\n\n".join(
+                texts.JOURNAL_ENTRY_FMT.format(
+                    title=html.escape(e["chat_title"] or e["chat_ref"] or "—"),
+                    created_at=(e["created_at"] or "").replace("T", " ")[:16],
+                    question=html.escape((e["question"] or "")[:150]),
+                    answer=html.escape((e["answer"] or "")[:150]),
+                )
+                for e in entries
+            )
+        else:
+            body = texts.JOURNAL_EMPTY
+        reminders = await self._db.list_reminders(user_id)
+        if reminders:
+            items = "\n".join(
+                texts.REMINDER_FMT.format(
+                    due_at=format_due(r["due_at"]),
+                    text=html.escape((r["text"] or "")[:80]),
+                )
+                for r in reminders
+            )
+            reminders_block = texts.REMINDERS_BLOCK.format(items=items)
+        else:
+            reminders_block = texts.REMINDERS_EMPTY
+        text = texts.JOURNAL_MENU.format(
+            count=len(entries), entries=body, reminders_block=reminders_block
+        )
+        kb_reminders = [
+            {"id": r["id"], "due_at": format_due(r["due_at"]), "text": r["text"]}
+            for r in reminders
+        ]
+        return text, kb.journal_menu(kb_reminders)
+
+    async def _send_journal_menu(self, message: Message) -> None:
+        await self._db.ensure_user(message.from_user.id)
+        text, markup = await self._journal_view(message.from_user.id)
+        await message.answer(text, reply_markup=markup)
+
+    async def _refresh_journal_menu(self, cb: CallbackQuery) -> None:
+        text, markup = await self._journal_view(cb.from_user.id)
+        try:
+            await cb.message.edit_text(text, reply_markup=markup)  # type: ignore[union-attr]
+        except TelegramAPIError:
+            logger.debug("Не вдалося оновити меню нагадувань", exc_info=True)
+
+    async def _kb_menu_text(self, user_id: int) -> str:
+        entries = await self._db.list_kb_entries(user_id)
+        total = await self._db.kb_total_chars(user_id)
+        return texts.KB_MENU.format(
+            count=len(entries), chars=total, limit=texts.KB_MAX_CHARS
+        )
+
+    @staticmethod
+    def _kb_list_view(entries: list[dict[str, Any]]) -> tuple[str, InlineKeyboardMarkup]:
+        if entries:
+            title = f"📋 <b>Записи бази знань</b> ({len(entries)}):"
+        else:
+            title = texts.KB_LIST_EMPTY
+        return title, kb.kb_entries_list(entries)
+
+    async def _make_profile_snapshot(self, user_id: int) -> dict[str, Any]:
+        """Знімок поточних налаштувань, короткого промпта й бази знань."""
+        settings = await self._db.get_settings(user_id)
+        settings_fields = {
+            key: settings[key]
+            for key in settings
+            if key not in ("last_error", "profile_name")
+        }
+        prompts = await self._db.get_prompts(user_id)
+        kb_entries = await self._db.list_kb_entries(user_id)
+        return {
+            "settings": settings_fields,
+            "base_prompt": prompts["base_prompt"],
+            "kb": [
+                {"title": e["title"], "content": e["content"]} for e in kb_entries
+            ],
+        }
+
+    async def _profiles_view(self, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        profiles = await self._db.list_profiles(user_id)
+        settings = await self._db.get_settings(user_id)
+        active = settings["profile_name"] or ""
+        if profiles:
+            items = "\n".join(
+                texts.PROFILE_ITEM_FMT.format(
+                    profile_id=p["id"],
+                    name=html.escape(p["name"]),
+                    created_at=(p["created_at"] or "").replace("T", " ")[:16],
+                )
+                + (texts.PROFILE_ACTIVE_MARK if p["name"] == active else "")
+                for p in profiles
+            )
+            text = texts.PROFILES_LIST.format(items=items)
+        else:
+            text = texts.PROFILES_EMPTY
+        return text, kb.profile_list(profiles, active)
+
+    async def _refresh_profiles_view(self, cb: CallbackQuery) -> None:
+        text, markup = await self._profiles_view(cb.from_user.id)
+        try:
+            await cb.message.edit_text(text, reply_markup=markup)  # type: ignore[union-attr]
+        except TelegramAPIError:
+            logger.debug("Не вдалося оновити список профілів", exc_info=True)
+
     async def _send_autoreply_menu(self, message: Message) -> None:
         await self._db.ensure_user(message.from_user.id)
         s = await self._db.get_settings(message.from_user.id)
+        summary = "Оберіть параметр:"
+        if s["profile_name"]:
+            summary += texts.AUTOREPLY_PROFILE_LINE.format(name=html.escape(s["profile_name"]))
         await message.answer(
-            texts.AUTOREPLY_MENU.format(summary="Оберіть параметр:"),
+            texts.AUTOREPLY_MENU.format(summary=summary),
             reply_markup=kb.autoreply_menu(
                 auto_reply=bool(s["auto_reply"]),
                 whitelist_mode=bool(s["whitelist_mode"]),

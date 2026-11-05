@@ -14,6 +14,7 @@ from .config import Config, load_config
 from .control_bot import build_router
 from .db import Database
 from .logging_setup import setup_logging
+from .reminders import reminder_loop
 from .userbot import Userbot
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,17 @@ def _make_admin_notifier(bot: Bot, admin_ids: tuple[int, ...]):
             logger.exception("Не вдалося надіслати сповіщення адміну")
 
     return notify
+
+
+def _make_reminder_sender(bot: Bot):
+    """Повертає async callback(user_id, text) для фонового циклу нагадувань."""
+    async def send(user_id: int, text: str) -> None:
+        try:
+            await bot.send_message(user_id, text)
+        except Exception:  # noqa: BLE001 — нагадування не повинно ламати цикл
+            logger.exception("Не вдалося надіслати нагадування користувачу %s", user_id)
+
+    return send
 
 
 async def run() -> None:
@@ -50,6 +62,9 @@ async def run() -> None:
     userbot.set_error_notifier(_make_admin_notifier(bot, config.admin_ids))
     router = build_router(config, db, userbot)
     dp.include_router(router)
+
+    # Фоновий цикл нагадувань (перевірка кожні 30 с)
+    reminders_task = asyncio.create_task(reminder_loop(db, _make_reminder_sender(bot)))
 
     if await userbot.start():
         logger.info("Userbot активний — авто-відповіді можуть працювати")
@@ -85,11 +100,18 @@ async def run() -> None:
 
     for task in pending:
         task.cancel()
+    reminders_task.cancel()
     try:
         await polling_task
     except asyncio.CancelledError:
         pass
     finally:
+        try:
+            await reminders_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 — зупинка не повинна падати
+            logger.exception("Помилка зупинки циклу нагадувань")
         await userbot.stop()
         await bot.session.close()
         logger.info("TelegramHub зупинено")

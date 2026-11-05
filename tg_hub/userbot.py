@@ -52,6 +52,8 @@ MEDIA_PLACEHOLDERS: tuple[tuple[str, str], ...] = (
     ("audio", "[аудіо]"),
 )
 
+KB_SECTION_HEADER = "БАЗА ЗНАНЬ (правила поведінки, факти про мене)"
+
 
 def media_placeholder(message: Any) -> str | None:
     """Короткий опис медіа-повідомлення (стікер, фото...) або None для тексту."""
@@ -252,6 +254,7 @@ class Userbot:
                 return
             self._cooldowns[chat_id] = time.monotonic()
             await self._humanized_send(chat_id, reply, settings)
+            await self._record_qa_entry(user_id, chat_id, burst, reply)
         except LLMError as exc:
             await self._record_error(chat_id, f"LLM: {exc}")
         except asyncio.CancelledError:
@@ -334,6 +337,11 @@ class Userbot:
         prompts = await self._db.get_prompts(user_id)
         context = await self._build_context(chat_id, int(settings["context_messages"]))
         system = self._system_prompt(prompts["base_prompt"], prompts["style_profile"])
+        kb_text = await self._db.get_full_kb(user_id)
+        if kb_text:
+            system += (
+                f"\n\n{'=' * 12} {KB_SECTION_HEADER} {'=' * 12}\n{kb_text}\n{'=' * 12}"
+            )
         latest = "\n".join(f"• {item}" for item in burst)
         user_content = (
             f"Історія діалогу:\n{context}\n\n"
@@ -370,6 +378,36 @@ class Userbot:
             await self.client.send_message(chat_id, chunk)
             if index < len(chunks) - 1:
                 await asyncio.sleep(random.uniform(0.8, 2.5))  # noqa: S311 — пауза між частинами
+
+    # --- журнал Q&A ---
+
+    async def _record_qa_entry(self, user_id: int, chat_id: int,
+                               burst: list[str], reply: str) -> None:
+        """Записати запис журналу «питання-відповідь» після успішної відповіді.
+
+        Кожна нова відповідь — окремий запис (burst не зливаються з попередніми).
+        """
+        try:
+            chat_ref = str(chat_id)
+            chat_title = ""
+            if self.client is not None:
+                try:
+                    chat = await self.client.get_entity(chat_id)
+                    chat_title = (
+                        getattr(chat, "title", None)
+                        or getattr(chat, "first_name", None)
+                        or ""
+                    )
+                    username = getattr(chat, "username", None)
+                    if username:
+                        chat_ref = f"@{username}"
+                except Exception:  # noqa: BLE001 — назва чату не критична
+                    logger.debug("Не вдалося отримати назву чату %s", chat_id, exc_info=True)
+            await self._db.add_qa_entry(
+                user_id, chat_ref, chat_title, "\n".join(burst), reply,
+            )
+        except Exception:  # noqa: BLE001 — журнал не повинен ламати відповідь
+            logger.exception("Не вдалося записати запис журналу Q&A")
 
     # --- помилки ---
 
