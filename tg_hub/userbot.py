@@ -37,6 +37,29 @@ TYPING_MIN_SECONDS = 1.0
 TYPING_MAX_SECONDS = 6.0
 ERROR_NOTIFY_INTERVAL = 600.0  # не спамити адміна частіше ніж раз на 10 хв
 
+# --- Burst-логіка: людина часто пише кілька повідомлень підряд ---
+DEBOUNCE_SECONDS = 2.0      # скільки чекати тиші перед відповіддю
+TYPING_GRACE = 2.5          # скільки рахувати «ще друкує» після останьої дії
+MAX_BURST_WAIT = 30.0       # стеля очікування, щоб не зависати назавжди
+
+MEDIA_PLACEHOLDERS: tuple[tuple[str, str], ...] = (
+    ("sticker", "[стикер]"),
+    ("photo", "[фото]"),
+    ("voice", "[голосове]"),
+    ("video_note", "[відео-повідомлення]"),
+    ("video", "[відео]"),
+    ("gif", "[гіф]"),
+    ("audio", "[аудіо]"),
+)
+
+
+def media_placeholder(message: Any) -> str | None:
+    """Короткий опис медіа-повідомлення (стікер, фото...) або None для тексту."""
+    for attr, label in MEDIA_PLACEHOLDERS:
+        if getattr(message, attr, None):
+            return label
+    return "[медіа]"
+
 
 def strip_markdown_artifacts(text: str) -> str:
     """Прибрати markdown-артефакти та дислеймери про ШІ."""
@@ -98,6 +121,10 @@ class Userbot:
         self._last_error_notify = 0.0
         self._own_username = ""
         self._error_notifier: Any = None
+        # burst-стан: накопичені повідомлення чату + активні задачі дебаунсу
+        self._pending: dict[int, list[str]] = {}
+        self._debounce_tasks: dict[int, asyncio.Task[None]] = {}
+        self._typing_until: dict[int, float] = {}  # chat_id -> до коли «друкує»
 
     # --- життєвий цикл ---
 
@@ -135,9 +162,14 @@ class Userbot:
         self._own_username = (getattr(me, "username", None) or "").lower()
         logger.info("Userbot підключено як %s (id=%s)", getattr(me, "first_name", "?"), user_id)
         self.client.add_event_handler(self._on_new_message, events.NewMessage(incoming=True))
+        self.client.add_event_handler(self._on_user_update, events.UserUpdate)
         return True
 
     async def stop(self) -> None:
+        for task in list(self._debounce_tasks.values()):
+            task.cancel()
+        self._debounce_tasks.clear()
+        self._pending.clear()
         if self.client is not None:
             try:
                 await self.client.disconnect()
@@ -152,11 +184,9 @@ class Userbot:
     # --- обробник вхідних повідомлень ---
 
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
-        """Вхідне повідомлення → фільтри → LLM → «людське» надсилання."""
+        """Вхідне повідомлення → фільтри → черга burst → (пауза тиші) → одна відповідь."""
         message = event.message
         if message.out or getattr(message, "action", None) is not None:
-            return
-        if not (message.message or "").strip():
             return
         if self._owner_user_id is None or message.sender_id == self._owner_user_id:
             return
@@ -168,18 +198,66 @@ class Userbot:
                 return
             if not await self._passes_filters(message, settings):
                 return
-            if not self._cooldown_ok(message.chat_id, int(settings["cooldown_seconds"])):
+
+            # текст або зрозумілий плейсхолдер для медіа (стікер/фото/голосове…)
+            text = (message.message or "").strip()
+            if not text:
+                text = media_placeholder(message)
+
+            chat_id = message.chat_id
+            self._pending.setdefault(chat_id, []).append(text)
+            # нове повідомлення скидає таймер тиші: попередню задачу — скасувати
+            old_task = self._debounce_tasks.get(chat_id)
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
+            self._debounce_tasks[chat_id] = asyncio.create_task(
+                self._debounced_reply(chat_id, user_id, settings),
+            )
+        except Exception as exc:  # noqa: BLE001 — не даємо обробнику впасти
+            await self._record_error(getattr(message, "chat_id", 0), f"{type(exc).__name__}: {exc}")
+
+    async def _on_user_update(self, event: Any) -> None:
+        """Співрозмовник друкує → продовжуємо чекати (максимум MAX_BURST_WAIT)."""
+        if not getattr(event, "typing", False):
+            return
+        chat_id = getattr(event, "chat_id", None) or getattr(event, "user_id", None)
+        if chat_id in self._pending:
+            self._typing_until[chat_id] = time.monotonic() + TYPING_GRACE
+
+    async def _debounced_reply(self, chat_id: int, user_id: int, settings: dict[str, Any]) -> None:
+        """Чекає тишу (і паузи «друкує»), потім ОДНА відповідь на весь burst."""
+        try:
+            deadline = time.monotonic() + MAX_BURST_WAIT
+            while True:
+                await asyncio.sleep(DEBOUNCE_SECONDS)
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                # людина друкує? зачекаемо ще одне вікно
+                if now < self._typing_until.get(chat_id, 0.0):
+                    continue
+                break
+
+            burst = self._pending.pop(chat_id, [])
+            self._debounce_tasks.pop(chat_id, None)
+            if not burst:
+                return
+            if not settings["auto_reply"]:
+                return
+            if not self._cooldown_ok(chat_id, int(settings["cooldown_seconds"])):
                 return
 
-            reply = await self._generate_reply(user_id, settings, message)
+            reply = await self._generate_reply(user_id, settings, chat_id, burst)
             if not reply:
                 return
-            self._cooldowns[message.chat_id] = time.monotonic()
-            await self._humanized_send(message, reply, settings)
+            self._cooldowns[chat_id] = time.monotonic()
+            await self._humanized_send(chat_id, reply, settings)
         except LLMError as exc:
-            await self._record_error(message.chat_id, f"LLM: {exc}")
-        except Exception as exc:  # noqa: BLE001 — не даємо обробнику впасти
-            await self._record_error(message.chat_id, f"{type(exc).__name__}: {exc}")
+            await self._record_error(chat_id, f"LLM: {exc}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await self._record_error(chat_id, f"{type(exc).__name__}: {exc}")
 
     # --- фільтри ---
 
@@ -240,7 +318,8 @@ class Userbot:
             system += f"\n\nПрофіль стилю:\n{style_profile}"
         return system
 
-    async def _generate_reply(self, user_id: int, settings: dict[str, Any], message: Any) -> str:
+    async def _generate_reply(self, user_id: int, settings: dict[str, Any],
+                              chat_id: int, burst: list[str]) -> str:
         key = await self._db.get_active_key(user_id)
         if key is None:
             logger.info("Немає активного LLM-ключа — авто-відповідь пропущено")
@@ -253,18 +332,21 @@ class Userbot:
             timeout=self._config.llm_timeout,
         )
         prompts = await self._db.get_prompts(user_id)
-        context = await self._build_context(message.chat_id, int(settings["context_messages"]))
+        context = await self._build_context(chat_id, int(settings["context_messages"]))
         system = self._system_prompt(prompts["base_prompt"], prompts["style_profile"])
+        latest = "\n".join(f"• {item}" for item in burst)
         user_content = (
             f"Історія діалогу:\n{context}\n\n"
-            f"Нове повідомлення співрозмовника: «{message.message.strip()}»\n"
-            "Напиши МОЮ відповідь (лише текст повідомлення, без лапок і пояснень)."
+            f"Щойно надійшло від співрозмовника (може бути кілька повідомлень підряд — "
+            f"прочитай їх як одне ціле і відповість на все разом):\n{latest}\n\n"
+            "Напиши МОЮ відповідь (лише текст повідомлення, без лапок і пояснень). "
+            "Одна відповідь на весь блок, не окремо на кожне повідомлення."
         )
         return await llm.chat([{"role": "user", "content": user_content}], system=system)
 
     # --- «людське» надсилання ---
 
-    async def _humanized_send(self, message: Any, reply: str, settings: dict[str, Any]) -> None:
+    async def _humanized_send(self, chat_id: int, reply: str, settings: dict[str, Any]) -> None:
         assert self.client is not None
         reply = strip_markdown_artifacts(reply)
         chunks = split_reply(reply, max_chunks=max(1, int(settings.get("max_chunks", 3))))
@@ -281,11 +363,11 @@ class Userbot:
                 max(TYPING_MIN_SECONDS, len(chunk) / TYPING_CHARS_PER_SECOND),
             )
             try:
-                await self.client.send_chat_action(message.chat_id, "typing")
+                await self.client.send_chat_action(chat_id, "typing")
             except Exception:  # noqa: BLE001 — chat_action не критичний
                 logger.debug("send_chat_action не вдався", exc_info=True)
             await asyncio.sleep(typing_seconds)
-            await self.client.send_message(message.chat_id, chunk)
+            await self.client.send_message(chat_id, chunk)
             if index < len(chunks) - 1:
                 await asyncio.sleep(random.uniform(0.8, 2.5))  # noqa: S311 — пауза між частинами
 
