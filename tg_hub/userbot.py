@@ -166,7 +166,7 @@ class Userbot:
             settings = await self._db.get_settings(user_id)
             if not settings["auto_reply"]:
                 return
-            if not self._passes_filters(message, settings):
+            if not await self._passes_filters(message, settings):
                 return
             if not self._cooldown_ok(message.chat_id, int(settings["cooldown_seconds"])):
                 return
@@ -183,12 +183,17 @@ class Userbot:
 
     # --- фільтри ---
 
-    def _passes_filters(self, message: Any, settings: dict[str, Any]) -> bool:
-        chat_id = str(message.chat_id)
-        username = getattr(message.chat, "username", None) if message.chat else None
+    async def _passes_filters(self, message: Any, settings: dict[str, Any]) -> bool:
+        # message.chat — це Peer без username; повний об'єкт беремо через get_chat()
+        try:
+            chat = await message.get_chat()
+        except Exception:  # noqa: BLE001 — чат недоступний → не ризикуємо
+            return False
+        username = getattr(chat, "username", None)
+        chat_id = str(chat.id if chat is not None else message.chat_id)
         entries = {str(e).strip().lstrip("@").lower() for e in settings["ignore_list"] + settings["whitelist_chats"]}
 
-        candidates = {chat_id.lower()}
+        candidates = {chat_id.lower(), str(message.chat_id).lower()}
         if username:
             candidates.add(username.lower())
 
