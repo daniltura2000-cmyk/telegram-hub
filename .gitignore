@@ -1,0 +1,25 @@
+# Секрети та локальні дані
+.env
+data/
+sessions/
+logs/
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# IDE / ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
