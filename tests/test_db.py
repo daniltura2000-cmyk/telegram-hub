@@ -346,3 +346,15 @@ def test_rudeness_instructions_structure():
     for lvl, tiers in RUDENESS_INSTRUCTIONS.items():
         assert all(isinstance(k, int) and k >= 3 for k in tiers)
         assert all(len(v) > 30 for v in tiers.values())
+
+
+def test_next_prompt_roundtrip(db):
+    import asyncio
+    async def run():
+        s = await db.get_settings(1)
+        assert s["next_prompt"] == ""
+        await db.update_settings(1, next_prompt='Напиши: "ок, пізніше"')
+        assert (await db.get_settings(1))["next_prompt"].startswith("Напиши:")
+        await db.update_settings(1, next_prompt="")
+        assert (await db.get_settings(1))["next_prompt"] == ""
+    asyncio.run(run())

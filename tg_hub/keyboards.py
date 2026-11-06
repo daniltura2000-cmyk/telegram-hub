@@ -266,6 +266,7 @@ def autoreply_menu(
     context_messages: int,
     cooldown_seconds: int,
     rudeness_level: int = 1,
+    next_prompt_hint: str = "",
 ) -> InlineKeyboardMarkup:
     on_off = texts.STATE_ON if auto_reply else texts.STATE_OFF
     mode = texts.MODE_WHITELIST if whitelist_mode else texts.MODE_ALL_EXCEPT
@@ -291,8 +292,19 @@ def autoreply_menu(
         ],
         [InlineKeyboardButton(text=texts.BTN_COOLDOWN.format(value=cooldown_seconds), callback_data="ar:cooldown")],
         [InlineKeyboardButton(text=texts.BTN_RUDENESS.format(mode=rude), callback_data="ar:rudeness")],
+        [InlineKeyboardButton(text=texts.BTN_NEXT_PROMPT.format(hint=next_prompt_hint), callback_data="ar:nextprompt")],
         *back_button_row(),
     ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def next_prompt_menu(has_prompt: bool) -> InlineKeyboardMarkup:
+    """Меню «Наступний промпт»: задати/скинути."""
+    rows = [[InlineKeyboardButton(
+        text=texts.BTN_NEXT_PROMPT_CLEAR if has_prompt else texts.BTN_NEXT_PROMPT.format(hint=""),
+        callback_data="ar:np:clear" if has_prompt else "ar:np:set",
+    )]]
+    rows.extend(back_button_row("nav:autoreply"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

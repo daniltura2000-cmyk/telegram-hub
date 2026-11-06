@@ -96,6 +96,10 @@ class ProfileStates(StatesGroup):
     name = State()
 
 
+class NextPromptStates(StatesGroup):
+    text = State()
+
+
 class AdminFilter(BaseFilter):
     """Пропускає лише адміністраторів з ADMIN_IDS."""
 
@@ -1431,6 +1435,67 @@ class ControlBot:
             await self._rudeness_menu(cb)
             await cb.answer()
 
+        @r.callback_query(F.data == "ar:nextprompt")
+        @error_guard
+        async def ar_nextprompt(cb: CallbackQuery) -> None:
+            s = await self._db.get_settings(cb.from_user.id)
+            has_prompt = bool((s.get("next_prompt") or "").strip())
+            snippet = ""
+            if has_prompt:
+                snippet = html.escape((s["next_prompt"] or "").strip()[:120])
+                if len((s["next_prompt"] or "").strip()) > 120:
+                    snippet += "…"
+            text = texts.NEXT_PROMPT_MENU
+            if snippet:
+                text += texts.NEXT_PROMPT_ACTIVE_LINE.format(snippet=snippet)
+            try:
+                await cb.message.edit_text(  # type: ignore[union-attr]
+                    text, reply_markup=kb.next_prompt_menu(has_prompt),
+                )
+            except TelegramAPIError:
+                await cb.message.answer(  # type: ignore[union-attr]
+                    text, reply_markup=kb.next_prompt_menu(has_prompt),
+                )
+            await cb.answer()
+
+        @r.callback_query(F.data == "ar:np:set")
+        @error_guard
+        async def np_set(cb: CallbackQuery, state: FSMContext) -> None:
+            await state.set_state(NextPromptStates.text)
+            await cb.message.answer(  # type: ignore[union-attr]
+                texts.NEXT_PROMPT_ASK, reply_markup=kb.cancel_inline(),
+            )
+            await cb.answer()
+
+        @r.callback_query(F.data == "ar:np:clear")
+        @error_guard
+        async def np_clear(cb: CallbackQuery) -> None:
+            await self._db.update_settings(cb.from_user.id, next_prompt="")
+            try:
+                await cb.message.edit_text(  # type: ignore[union-attr]
+                    texts.NEXT_PROMPT_CLEARED,
+                    reply_markup=kb.next_prompt_menu(False),
+                )
+            except TelegramAPIError:
+                await cb.message.answer(  # type: ignore[union-attr]
+                    texts.NEXT_PROMPT_CLEARED,
+                    reply_markup=kb.next_prompt_menu(False),
+                )
+            await cb.answer()
+
+        @r.message(NotMenuText(), NextPromptStates.text)
+        @error_guard
+        async def np_input(message: Message, state: FSMContext) -> None:
+            text = (message.text or "").strip()
+            if not text:
+                await message.answer(texts.NEXT_PROMPT_ASK, reply_markup=kb.cancel_inline())
+                return
+            if len(text) > 2000:
+                text = text[:2000]
+            await self._db.update_settings(message.from_user.id, next_prompt=text)
+            await state.clear()
+            await message.answer(texts.NEXT_PROMPT_SAVED)
+
         @r.callback_query(F.data.startswith("ar:rude:"))
         @error_guard
         async def ar_rude_set(cb: CallbackQuery) -> None:
@@ -1683,6 +1748,7 @@ class ControlBot:
     async def _autoreply_markup(self, user_id: int) -> InlineKeyboardMarkup:
         """Клавіатура «Налаштування авто-відповідей» зі свіжими значеннями."""
         s = await self._db.get_settings(user_id)
+        np_active = bool((s.get("next_prompt") or "").strip())
         return kb.autoreply_menu(
             auto_reply=bool(s["auto_reply"]),
             whitelist_mode=bool(s["whitelist_mode"]),
@@ -1693,6 +1759,7 @@ class ControlBot:
             context_messages=int(s["context_messages"]),
             cooldown_seconds=int(s["cooldown_seconds"]),
             rudeness_level=int(s.get("rudeness_level", 1) or 0),
+            next_prompt_hint=" ✅" if np_active else "",
         )
 
     async def _rudeness_menu(self, cb: CallbackQuery) -> None:

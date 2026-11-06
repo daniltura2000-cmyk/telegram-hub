@@ -379,6 +379,10 @@ class Userbot:
             self._typing_until.pop(chat_id, None)  # не накопичуємо застарілі записи
             # ми відповіли — серія «людина пише без відповіді» обнуляється
             self._rude_streak[chat_id] = 0
+            # одноразовий «наступний промпт» використано — стираємо
+            if (settings.get("next_prompt") or "").strip():
+                await self._db.update_settings(user_id, next_prompt="")
+                logger.info("Одноразовий «наступний промпт» використано і стерто")
             await self._record_qa_entry(user_id, chat_id, burst, reply)
         except LLMError as exc:
             await self._record_error(chat_id, f"LLM: {exc}")
@@ -532,6 +536,7 @@ class Userbot:
             )
         latest = "\n".join(f"• {item}" for item in burst)
         current_time = datetime.now().strftime("%H:%M")
+        next_prompt = (settings.get("next_prompt") or "").strip()
         user_content = (
             f"ОСТАННІ ПОВІДОМЛЕННЯ (найважливіше — відповідай САМЕ на це; "
             f"може бути кілька повідомлень підряд — прочитай їх як одне ціле "
@@ -555,6 +560,19 @@ class Userbot:
             "Напиши МОЮ відповідь (лише текст повідомлення, без лапок і пояснень). "
             "Одна відповідь на весь блок, не окремо на кожне повідомлення."
         )
+        if next_prompt:
+            # одноразовий директив власника для ЦІЄЇ відповіді: вищий пріоритет
+            # за стиль і правила (але персона/рід не ламаються)
+            user_content = (
+                "‼️ ГОЛОВНИЙ ДИРЕКТИВ ВЛАСНИКА ДЛЯ ЦІЄЇ ВІДПОВІДІ (вищий пріоритет "
+                "за історію, стиль і правила нижче; всі інші правила діятимуть "
+                "починаючи з НАСТУПНОЇ відповіді):\n"
+                f"{next_prompt}\n\n"
+                "Якщо директив містить готовий текст у лапках — надішли ЙОГО "
+                "ДОСЛІВНО, без змін і доповнень. Інакше — виконай директив, "
+                "зберігаючи мій стиль.\n\n"
+                + user_content
+            )
         reply = await llm.chat([{"role": "user", "content": user_content}], system=system)
         elapsed = time.perf_counter() - started
         logger.info("LLM raw reply: %d симв., перші 80: %r", len(reply or ""), (reply or "")[:80])
