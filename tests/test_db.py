@@ -19,7 +19,7 @@ async def test_user_and_settings_defaults(db: Database):
     assert settings["auto_reply"] == 0
     assert settings["whitelist_mode"] == 1
     assert settings["ignore_list"] == []
-    assert settings["reply_delay_min"] == 3.0
+    assert settings["reply_delay_min"] == 1.5
     assert settings["context_messages"] == 20
     # повторне читання не змінює значень
     again = await db.get_settings(1)

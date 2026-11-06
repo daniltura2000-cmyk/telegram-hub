@@ -188,8 +188,8 @@ def test_burst_reply_threshold_constant():
     from tg_hub import userbot
 
     assert userbot.BURST_REPLY_THRESHOLD == 3
-    assert userbot.DEBOUNCE_SECONDS == 2.0
-    assert userbot.MAX_BURST_WAIT == 30.0
+    assert userbot.DEBOUNCE_SECONDS == 1.0
+    assert userbot.MAX_BURST_WAIT == 15.0
 
 
 def test_split_reply_chunks():

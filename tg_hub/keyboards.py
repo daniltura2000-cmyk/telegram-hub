@@ -19,8 +19,14 @@ def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def back_button_row() -> list[list[InlineKeyboardButton]]:
-    return [[InlineKeyboardButton(text=texts.BTN_BACK, callback_data="nav:back")]]
+def back_button_row(target: str = "nav:main") -> list[list[InlineKeyboardButton]]:
+    """Рядок «Повернутись» із цільовим РОДІЧСЬКИМ меню (не лише головним)."""
+    return [[InlineKeyboardButton(text=texts.BTN_BACK, callback_data=target)]]
+
+
+def back_markup(target: str = "nav:main") -> InlineKeyboardMarkup:
+    """Клавіатура з однією кнопкою «Повернутись» — для відповідей-повідомлень."""
+    return InlineKeyboardMarkup(inline_keyboard=back_button_row(target))
 
 
 def api_keys_menu() -> InlineKeyboardMarkup:
@@ -40,7 +46,7 @@ def provider_choice() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🟡 DeepSeek", callback_data="keyprov:openai:https://api.deepseek.com/v1")],
         [InlineKeyboardButton(text="🟠 Anthropic", callback_data="keyprov:anthropic")],
         [InlineKeyboardButton(text="⚙️ Інший OpenAI-сумісний (свій URL)", callback_data="keyprov:openai")],
-        *back_button_row(),
+        *back_button_row("nav:keys"),
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -61,16 +67,7 @@ def model_choice(models: list[str]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(
         text="⌨️ Інша модель (ввести вручну)", callback_data="keymodel:__manual__",
     )])
-    rows.extend(back_button_row())
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def key_actions(key_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"✅ Активувати #{key_id}", callback_data=f"key:activate:{key_id}")],
-        [InlineKeyboardButton(text=f"🗑 Видалити #{key_id}", callback_data=f"key:delete:{key_id}")],
-        *back_button_row(),
-    ]
+    rows.extend(back_button_row("nav:keys"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -86,7 +83,7 @@ def key_list(keys: list[dict]) -> InlineKeyboardMarkup:
         ])
     if not rows:
         rows.append([InlineKeyboardButton(text="—", callback_data="noop")])
-    rows.extend(back_button_row())
+    rows.extend(back_button_row("nav:keys"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -114,7 +111,7 @@ def prompt_edit_menu() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=texts.BTN_PROMPT_EDIT, callback_data="prompt:edit")],
         [InlineKeyboardButton(text=texts.BTN_PROMPT_RESET, callback_data="prompt:reset")],
-        *back_button_row(),
+        *back_button_row("nav:prompt"),
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -124,7 +121,7 @@ def kb_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=texts.BTN_KB_ADD, callback_data="kb:add")],
         [InlineKeyboardButton(text=texts.BTN_KB_LIST, callback_data="kb:list")],
         [InlineKeyboardButton(text=texts.BTN_KB_EXPORT, callback_data="kb:export")],
-        *back_button_row(),
+        *back_button_row("nav:prompt"),
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -141,7 +138,7 @@ def kb_entries_list(entries: list[dict]) -> InlineKeyboardMarkup:
     if not rows:
         rows.append([InlineKeyboardButton(text="—", callback_data="noop")])
     rows.append([InlineKeyboardButton(text=texts.BTN_KB_ADD, callback_data="kb:add")])
-    rows.extend(back_button_row())
+    rows.extend(back_button_row("nav:kblist"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -184,7 +181,7 @@ def profile_list(profiles: list[dict], active_name: str) -> InlineKeyboardMarkup
         ])
     if not rows:
         rows.append([InlineKeyboardButton(text="—", callback_data="noop")])
-    rows.extend(back_button_row())
+    rows.extend(back_button_row("nav:profiles"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -213,7 +210,7 @@ def dialogs_one(dialogs: list[tuple[int, str, str]]) -> InlineKeyboardMarkup:
     ]
     if not rows:
         rows = [[InlineKeyboardButton(text="—", callback_data="noop")]]
-    rows.extend(back_button_row())
+    rows.extend(back_button_row("nav:style"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -225,7 +222,7 @@ def dialogs_perchat(dialogs: list[tuple[int, str, str]]) -> InlineKeyboardMarkup
     ]
     if not rows:
         rows = [[InlineKeyboardButton(text="—", callback_data="noop")]]
-    rows.extend(back_button_row())
+    rows.extend(back_button_row("nav:style"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -238,7 +235,7 @@ def chat_profile_list(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     ]
     if not rows:
         rows = [[InlineKeyboardButton(text="—", callback_data="noop")]]
-    rows.extend(back_button_row())
+    rows.extend(back_button_row("nav:style"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -254,7 +251,7 @@ def dialogs_multi(dialogs: list[tuple[int, str, str]], selected: set[str]) -> In
         InlineKeyboardButton(text=texts.BTN_STYLE_DONE_MULTI, callback_data="style:donemulti"),
         InlineKeyboardButton(text=texts.BTN_MULTI_CLEAR, callback_data="style:clearmulti"),
     ])
-    rows.extend(back_button_row())
+    rows.extend(back_button_row("nav:style"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -306,7 +303,7 @@ def list_manage(items: list[str], prefix: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=texts.BTN_LIST_ADD, callback_data=f"{prefix}:add"),
         InlineKeyboardButton(text=texts.BTN_LIST_CLEAR, callback_data=f"{prefix}:clear"),
     ])
-    rows.extend(back_button_row())
+    rows.extend(back_button_row("nav:autoreply"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

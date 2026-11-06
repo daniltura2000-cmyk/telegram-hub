@@ -40,8 +40,8 @@ CREATE TABLE IF NOT EXISTS settings (
     whitelist_mode         INTEGER NOT NULL DEFAULT 1,
     whitelist_chats        TEXT    NOT NULL DEFAULT '[]',
     ignore_list            TEXT    NOT NULL DEFAULT '[]',
-    reply_delay_min        REAL    NOT NULL DEFAULT 3.0,
-    reply_delay_max        REAL    NOT NULL DEFAULT 10.0,
+    reply_delay_min        REAL    NOT NULL DEFAULT 1.5,
+    reply_delay_max        REAL    NOT NULL DEFAULT 3.0,
     only_private_or_mention INTEGER NOT NULL DEFAULT 0,
     context_messages       INTEGER NOT NULL DEFAULT 20,
     cooldown_seconds       INTEGER NOT NULL DEFAULT 60,
@@ -120,8 +120,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "whitelist_mode": 1,
     "whitelist_chats": [],
     "ignore_list": [],
-    "reply_delay_min": 3.0,
-    "reply_delay_max": 10.0,
+    "reply_delay_min": 1.5,
+    "reply_delay_max": 3.0,
     "only_private_or_mention": 0,
     "context_messages": 20,
     "cooldown_seconds": 60,
@@ -177,6 +177,12 @@ class Database:
             conn.execute(
                 "ALTER TABLE settings ADD COLUMN profile_name TEXT NOT NULL DEFAULT ''"
             )
+        # Старі дефолти reply_delay 3.0-10.0 с давали надто велику затримку відповіді:
+        # рядки, які досі на старих дефолтах (власник їх не змінював), тягнемо до нових.
+        conn.execute(
+            "UPDATE settings SET reply_delay_min = 1.5, reply_delay_max = 3.0 "
+            "WHERE reply_delay_min = 3.0 AND reply_delay_max = 10.0"
+        )
 
     async def init(self) -> None:
         await self._run(self._init_sync)

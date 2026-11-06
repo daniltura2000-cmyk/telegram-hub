@@ -22,6 +22,7 @@ ERR_GENERIC = "⚠️ Сталася помилка. Спробуйте ще р�
 ERR_NOT_CONNECTED = "⚠️ Акаунт Telegram не підключено. Спочатку підключіть акаунт."
 ERR_NO_ACTIVE_KEY = "⚠️ Немає активного API-ключа ШІ. Додайте ключ у розділі «API ключі ШІ»."
 SAVED = "✅ Збережено."
+CANCELLED = "❌ Дію скасовано."
 
 # --- API ключі ---
 API_KEYS_MENU = (
@@ -37,8 +38,6 @@ CHOOSE_PROVIDER = (
     "<a href=\"https://aistudio.google.com/app/apikey\">aistudio.google.com/app/apikey</a> "
     "(кнопка «Get API key», безкоштовно)."
 )
-PROVIDER_OPENAI = "🟢 OpenAI-сумісний"
-PROVIDER_ANTHROPIC = "🟠 Anthropic"
 PROVIDER_GOOGLE = "🔵 Google Gemini"
 ASK_BASE_URL = (
     "🌐 <b>Базовий URL</b> — адреса API провайдера.\n\n"
@@ -71,7 +70,6 @@ ASK_MODEL = (
     "• Gemini: <code>gemini-2.0-flash</code>\n"
     "• Anthropic: <code>claude-sonnet-4-20250514</code>"
 )
-KEY_ADDED = "✅ Ключ #{key_id} додано ({provider}). Активний: ні."
 KEY_ADDED_ACTIVE = "✅ Ключ #{key_id} додано ({provider}) — модель {model}. Ключ активний ⭐"
 MODELS_FOUND = (
     "✅ Ключ працює! Доступних моделей: {count}.\n\nОберіть модель кнопкою нижче "
@@ -81,7 +79,6 @@ MODEL_VERIFYING = "⏳ Перевіряю модель «{model}» реальн�
 KEY_LIST_EMPTY = "Ключів ще немає."
 KEY_ACTIVATE_DONE = "✅ Ключ #{key_id} тепер активний."
 KEY_DELETED = "🗑 Ключ #{key_id} видалено."
-KEY_ALREADY_ACTIVE = "Цей ключ уже активний."
 KEY_LABEL_FMT = "#{key_id} · {provider} · {model} · …{tail}{active_mark}"
 
 # --- Підключення акаунта ---
@@ -123,19 +120,6 @@ CONNECT_SUCCESS = "✅ Акаунт підключено! Сесію збере�
 CONNECT_FAILED = "⚠️ Не вдалося підключити акаунт: {reason}"
 ERR_INVALID_API_ID = "⚠️ api_id має бути числом."
 BTN_QR_LOGIN = "📷 Вхід через QR-код"
-QR_INTRO = (
-    "📷 <b>Вхід через QR-код</b>\n\n"
-    "Жоден код у повідомленні не потрібен: ви підтвердите вхід з пристрою, "
-    "на якому вже залогінені в Telegram (ваш телефон або комп'ютер).\n\n"
-    "Кроки:\n"
-    "1️⃣ Введіть api_id та api_hash (з my.telegram.org/apps)\n"
-    "2️⃣ Я надішлю QR-код і кнопку-посилання\n"
-    "3️⃣ Відкрийте Telegram на телефоні → <b>Налаштування → Пристрої → "
-    "Пов'язати пристрій</b> → відскануйте QR\n"
-    "   (або просто натисніть кнопку-посилання під QR-кодом)\n"
-    "4️⃣ Підтвердьте вхід — і все.\n\n"
-    "⚠️ Підтвердити може ЛИШЕ ваш власний акаунт."
-)
 QR_READY = (
     "📷 <b>QR-код готовий!</b>\n\n"
     "Варіант А: відкрийте Telegram на телефоні → <b>Налаштування → Пристрої → "
@@ -212,7 +196,6 @@ NO_DIALOGS = "Не знайдено діалогів."
 MULTI_SELECTED = "Обрано: {count}"
 ANALYSIS_STARTED = "⏳ Аналізую переписку (до {limit} повідомлень на чат)… Це може тривати до хвилини."
 ANALYSIS_DONE = "✅ Профіль стилю оновлено."
-NO_OWN_MESSAGES = "⚠️ Не знайдено ваших вихідних повідомлень у обраних чатах."
 STYLE_PROFILE_EMPTY = "Профіль стилю ще не створено."
 STYLE_PROFILE_HEADER = "🧠 <b>Профіль стилю</b>\n\n<pre>{profile}</pre>"
 CHAT_PROFILE_MENU = (
@@ -225,7 +208,6 @@ CHAT_PROFILE_DONE = "✅ Профіль для чату {title} збережен
 CHAT_PROFILE_SHOW_HEADER = "👤 <b>Профіль чату {title}</b>\n\n<pre>{profile}</pre>"
 CHAT_PROFILE_EMPTY = "Пер-чат профілів ще немає. Створіть через «👤 Профіль цієї людини»."
 CHAT_PROFILE_DELETED = "🗑 Пер-чат профіль видалено — у цьому чаті знову діє загальний профіль."
-NO_CHAT_PROFILES = "Ще немає жодного пер-чат профілю."
 
 # --- Налаштування авто-відповідей ---
 AUTOREPLY_MENU = "⚙️ <b>Налаштування авто-відповідей</b>\n\n{summary}"
@@ -242,7 +224,7 @@ BTN_REPLY_DELAY = "⏱ Затримка відповіді: {min:.0f}–{max:.0f
 BTN_MAX_CHUNKS = "✂️ Макс. частин: {value}"
 BTN_CONTEXT_COUNT = "💬 Контекст: {value} повідомлень"
 BTN_COOLDOWN = "🌡 Кулдаун: {value} с"
-IGNORE_LIST_TITLE = "🚫 <b>Ігнор-лист</b> ({mode_hint}):\n{items}"
+IGNORE_LIST_TITLE = "🚫 <b>Ігнор-лист</b>:\n{items}"
 WHITELIST_TITLE = "✅ <b>Білий список</b>:\n{items}"
 EMPTY_LIST = "порожньо"
 BTN_LIST_ADD = "➕ Додати"

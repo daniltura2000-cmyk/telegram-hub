@@ -120,6 +120,10 @@ async def run() -> None:
                 logger.exception("Помилка зупинки задачі %s", name)
         # нагадування вже зупинено вище — тепер можна безпечно закривати клієнтів
         await userbot.stop()
+        control_bot = getattr(router, "control_bot", None)
+        if control_bot is not None:
+            # незавершені підключення/QR-очікування не мають пережити зупинку (docs/TZ_v2.md B2)
+            await control_bot.close_pending()
         await bot.session.close()
         logger.info("TelegramHub зупинено")
 

@@ -33,17 +33,20 @@ _MD_ARTIFACTS = (
     ("__", ""),
     ("###", ""),
     ("##", ""),
+    ("`", ""),  # одиночні бектіки теж markdown-сміття для звичайного TG-повідомлення
 )
 # Фрази, якими «палиться» ШІ: канцелярит, assistant-стартери, звернення-прощання.
 _AI_TELLS_PATTERNS = (
-    re.compile(r"^\s*(Сподіва(ємся|юсь|юся)[^\n.!?\n]*[.!?\n]?\s*|"
-               r"(Радий|Готовий|Рада|Готова) (допомогти|відповісти)[^\n.!?\n]*[.!?\n]?\s*|"
+    # У класах виключено також ем-дефіси (—/–): інакше жадібний клас з'їдає
+    # ВЕСЬ залишок рядка («Сподіваюсь, все ок — напиши завтра» → порожньо).
+    re.compile(r"^\s*(Сподіва(ємся|юсь|юся)[^\n.!?\n—–]*[.!?\n]?\s*|"
+               r"(Радий|Готовий|Рада|Готова) (допомогти|відповісти)[^\n.!?\n—–]*[.!?\n]?\s*|"
                r"(Гарне|Чудове) запитання[.!]?\s*|"
                r"Звісно[,!.]?\s*|Звичайно[,!.]?\s*|"
-               r"Дава(й|йте) роз(бер|глянем|беремо|глядемо)[^\n.!?\n]*[.!?\n]?\s*|"
-               r"(Резюмуючи|Підсумовуючи)[^\n.:!?\n]*[:.]?\s*|"
+               r"Дава(й|йте) роз(бер|глянем|беремо|глядемо)[^\n.!?\n—–]*[.!?\n]?\s*|"
+               r"(Резюмуючи|Підсумовуючи)[^\n.:!?—–]*[:.]?\s*|"
                r"Отже[,;.]\s*|Висновок[:.]?\s*|У висновку[,:]?\s*)", re.IGNORECASE),
-    re.compile(r"\b(резюмуючи|підсумовуючи)\b[^\n.:!?]*[:.]?\s*", re.IGNORECASE),
+    re.compile(r"\b(резюмуючи|підсумовуючи)\b[^\n.:!?—–]*[:.]?\s*", re.IGNORECASE),
     re.compile(r"\b(як штучний інтелект|як ШІ|як мовна модель|як асистент)\b", re.IGNORECASE),
     re.compile(r"\s*\b(не соромтеся звертатись|не соромся звертатись|звертайтеся якщо|"
                r"звертайся якщо|якщо будуть питання|якщо виникнуть питання)[^\n]*", re.IGNORECASE),
@@ -56,9 +59,9 @@ TYPING_MAX_SECONDS = 6.0
 ERROR_NOTIFY_INTERVAL = 600.0  # не спамити адміна частіше ніж раз на 10 хв
 
 # --- Burst-логіка: людина часто пише кілька повідомлень підряд ---
-DEBOUNCE_SECONDS = 2.0      # скільки чекати тиші перед відповіддю
-TYPING_GRACE = 2.5          # скільки рахувати «ще друкує» після останьої дії
-MAX_BURST_WAIT = 30.0       # стеля очікування, щоб не зависати назавжди
+DEBOUNCE_SECONDS = 1.0      # скільки чекати тиші перед відповіддю
+TYPING_GRACE = 1.5          # скільки рахувати «ще друкує» після останньої дії
+MAX_BURST_WAIT = 15.0       # стеля очікування, щоб не зависати назавжди
 BURST_REPLY_THRESHOLD = 3   # ≥3 повідомлень — контекст зрозумілий, відповідаємо раніше
 
 MEDIA_PLACEHOLDERS: tuple[tuple[str, str], ...] = (
@@ -72,6 +75,10 @@ MEDIA_PLACEHOLDERS: tuple[tuple[str, str], ...] = (
 )
 
 KB_SECTION_HEADER = "БАЗА ЗНАНЬ (правила поведінки, факти про мене)"
+
+# Ліміти промпта: довгий контекст = довга відповідь (латентність + «розмазана» увага).
+CONTEXT_MAX_CHARS = 3000    # зібрана історія: тримаємо найСВІЖІШІ повідомлення
+KB_MAX_CHARS = 4000         # база знань: беремо лише початок (найважливіші записи)
 
 
 def media_placeholder(message: Any) -> str | None:
@@ -294,7 +301,7 @@ class Userbot:
                 # ≥3 повідомлень — контекст зрозумілий, не змушуємо чекати
                 if len(self._pending.get(chat_id, [])) >= BURST_REPLY_THRESHOLD:
                     break
-                # людина друкує? зачекаемо ще одне вікно
+                # людина друкує? зачекаємо ще одне вікно
                 if now < self._typing_until.get(chat_id, 0.0):
                     continue
                 break
@@ -404,7 +411,15 @@ class Userbot:
                 except Exception:  # noqa: BLE001 — без часу теж ок
                     pass
                 pairs.append((bool(msg.out), text, time_label))
-        return format_context(pairs, max_messages=limit)
+        context_text = format_context(pairs, max_messages=limit)
+        # Рядки хронологічні (найстаріші зверху): якщо зібраний контекст завеликий —
+        # обрізаємо СТАРІ повідомлення зверху, тримаємо найсвіжіші.
+        if len(context_text) > CONTEXT_MAX_CHARS:
+            kept = context_text.splitlines()
+            while len("\n".join(kept)) > CONTEXT_MAX_CHARS and len(kept) > 1:
+                kept.pop(0)
+            context_text = "…(старіші повідомлення обрізано)\n" + "\n".join(kept)
+        return context_text
 
     def _system_prompt(self, base_prompt: str, style_profile: str) -> str:
         system = base_prompt or DEFAULT_BASE_PROMPT
@@ -416,6 +431,7 @@ class Userbot:
 
     async def _generate_reply(self, user_id: int, settings: dict[str, Any],
                               chat_id: int, burst: list[str]) -> str:
+        started = time.perf_counter()  # DEBUG-таймінг: видно в .run_log
         key = await self._db.get_active_key(user_id)
         if key is None:
             logger.info("Немає активного LLM-ключа — авто-відповідь пропущено")
@@ -436,30 +452,44 @@ class Userbot:
         system = self._system_prompt(prompts["base_prompt"], style)
         kb_text = await self._db.get_full_kb(user_id)
         if kb_text:
+            if len(kb_text) > KB_MAX_CHARS:  # голова: найважливіші (перші) записи
+                kb_text = kb_text[:KB_MAX_CHARS] + "…"
             system += (
                 f"\n\n{'=' * 12} {KB_SECTION_HEADER} {'=' * 12}\n{kb_text}\n{'=' * 12}"
             )
         latest = "\n".join(f"• {item}" for item in burst)
         current_time = datetime.now().strftime("%H:%M")
         user_content = (
-            f"Історія діалогу (у квадратних дужках — місцевий час):\n{context}\n\n"
+            f"ОСТАННІ ПОВІДОМЛЕННЯ (найважливіше — відповідай САМЕ на це; "
+            f"може бути кілька повідомлень підряд — прочитай їх як одне ціле "
+            f"і відповіси на все разом):\n{latest}\n\n"
+            f"ІСТОРІЯ ДІАЛОГУ (фон/контекст, у квадратних дужках — місцевий час):\n{context}\n\n"
             f"Зараз: [{current_time}]\n\n"
             "ЯК АНАЛІЗУВАТИ КОНТЕКСТ:\n"
             "1. Подивись на часові мітки (сьогоднішні — [ГГ:ХХ], давніші — "
             "[ДД.ММ ГГ:ХХ]): повідомлення з інших днів або давно "
             "завершені теми — це СТАРИЙ КОНТЕКСТ. Тримай його на увазі (згадай, "
             "якщо співрозмовник повертається до нього), але не відповідай на нього.\n"
-            "2. Останні повідомлення співрозмовника порівняй зі старим контекстом: "
+            "2. Останні повідомлення (ОСТАННІ ПОВІДОМЛЕННЯ вище) порівняй з історією: "
             "якщо це ПРОДОВЖЕННЯ попередньої теми — відповідай у її руслі, "
             "як НОВА ТЕМА — відповідай на нову тему, не тягни стару.\n"
-            "3. Відповідай природно, як жива людина: коротко, без офіційності, "
+            "3. Якщо останнє повідомлення - питання, на яке в історії або базі знань "
+            "немає відповіді, НЕ вигадуй факти: відповісь так, як відповів би "
+            "реальний власник - ухильно, зрозуміло з контексту, або коротко "
+            "признаюся що не в курсі (у стилі власника).\n"
+            "4. Відповідай природно, як жива людина: коротко, без офіційності, "
             "варіюй формулювання. Не переказуй питання — відповідай на нього.\n\n"
-            f"Щойно надійшло від співрозмовника (може бути кілька повідомлень підряд — "
-            f"прочитай їх як одне ціле і відповіси на все разом):\n{latest}\n\n"
             "Напиши МОЮ відповідь (лише текст повідомлення, без лапок і пояснень). "
             "Одна відповідь на весь блок, не окремо на кожне повідомлення."
         )
-        return await llm.chat([{"role": "user", "content": user_content}], system=system)
+        reply = await llm.chat([{"role": "user", "content": user_content}], system=system)
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "LLM відповідь згенеровано за %.2fs (чат %s, контекст %d симв., "
+            "KB %d симв., burst %d повід.)",
+            elapsed, chat_id, len(context), len(kb_text or ""), len(burst),
+        )
+        return reply
 
     # --- «людське» надсилання ---
 
@@ -474,7 +504,7 @@ class Userbot:
 
         await asyncio.sleep(random.uniform(delay_min, delay_max))  # noqa: S311 — імітація людини
 
-        for index, chunk in enumerate(chunks):
+        for chunk in chunks:
             typing_seconds = min(
                 TYPING_MAX_SECONDS,
                 max(TYPING_MIN_SECONDS, len(chunk) / TYPING_CHARS_PER_SECOND),
@@ -485,8 +515,8 @@ class Userbot:
                 logger.debug("send_chat_action не вдався", exc_info=True)
             await asyncio.sleep(typing_seconds)
             await self.client.send_message(chat_id, chunk)
-            if index < len(chunks) - 1:
-                await asyncio.sleep(random.uniform(0.8, 2.5))  # noqa: S311 — пауза між частинами
+            # між частинами додаткової паузи немає: імітація друку (typing_seconds)
+            # вже дає людський ритм, а зайві 0.8-2.5 с тільки збільшували латентність
 
     # --- журнал Q&A ---
 
