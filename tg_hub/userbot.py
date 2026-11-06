@@ -64,6 +64,34 @@ TYPING_GRACE = 1.5          # скільки рахувати «ще друку�
 MAX_BURST_WAIT = 15.0       # стеля очікування, щоб не зависати назавжди
 BURST_REPLY_THRESHOLD = 3   # ≥3 повідомлень — контекст зрозумілий, відповідаємо раніше
 
+# --- система грубості: людина НЕВИМАННО пише → відповіді дедалі холодніші ---
+# lvl: 0=вимк, 1=м'яко, 2=нормально, 3=жорстко.
+# RUDENESS_INSTRUCTIONS[lvl] = {поріг_повідомлень_підряд: інструкція для LLM}
+RUDENESS_INSTRUCTIONS: dict[int, dict[int, str]] = {
+    1: {  # м'яко
+        4: "Людина пише багато повідомлень підряд. Відповідай ДУЖЕ коротко і "
+           "неохоче (1-5 слів), без запитань і без бажання продовжувати розмову.",
+    },
+    2: {  # нормально
+        4: "Людина пише вже кілька повідомлень підряд. Відповідай сухо і коротко "
+           "(до 5 слів), без запитань, холодно.",
+        7: "Людина явно затягнула монолог. Ти дратуєшся: відповідь 1-4 слова, "
+           "можна з легкою іронією або невдоволенням («ну ок», «я зрозумів», «давай потім»).",
+        10: "Людина пише НЕВИМАННО. Прямо дай зрозуміти, що тобі це набридло: "
+            "коротко і різко («гей, стій», «я зайнятий, відпиши потім», «зачини вже цю тему»). "
+            "Без образ, але щиро — так робить жива людина.",
+    },
+    3: {  # жорстко
+        3: "Людина пише забагато. Відповідай сухо, 1-5 слів, з помітною неохотою.",
+        6: "Ти явно роздратований нескінченним монологом. Різко і зухвало дай "
+           "зрозуміти, що вона забагато пише («хлопче, я не читаю ці поеми», "
+           "«зачини вже»). У стилі власника.",
+        9: "Людина пише безупинно. ПОШЛИ ЇЇ відкрито і грубо, як по-справжньому "
+           "роздратований живий чоловік («відчепись», «завали хайло»). "
+           "Без цензури, у стилі власника, коротко.",
+    },
+}
+
 MEDIA_PLACEHOLDERS: tuple[tuple[str, str], ...] = (
     ("sticker", "[стикер]"),
     ("photo", "[фото]"),
@@ -170,6 +198,9 @@ class Userbot:
         self._owner_user_id = owner_user_id
         self.client: TelegramClient | None = None
         self._cooldowns: dict[int, float] = {}
+        # лічильник «неперевершеності»: скільки повідомлень підряд людина
+        # написала без нашої відповіді між ними (скидання після нашої відповіді)
+        self._rude_streak: dict[int, int] = {}
         self._last_error_notify = 0.0
         self._own_username = ""
         self._error_notifier: Any = None
@@ -346,6 +377,8 @@ class Userbot:
             # впав — наступне повідомлення не блокується «порожнім» кулдауном
             self._cooldowns[chat_id] = time.monotonic()
             self._typing_until.pop(chat_id, None)  # не накопичуємо застарілі записи
+            # ми відповіли — серія «людина пише без відповіді» обнуляється
+            self._rude_streak[chat_id] = 0
             await self._record_qa_entry(user_id, chat_id, burst, reply)
         except LLMError as exc:
             await self._record_error(chat_id, f"LLM: {exc}")
@@ -473,6 +506,16 @@ class Userbot:
         # пер-чат профіль має пріоритет над глобальним
         chat_profile = await self._db.get_chat_profile(user_id, str(chat_id))
         style = chat_profile or prompts["style_profile"]
+        # система грубості: скільки повідомлень підряд людина пише без нашої відповіді
+        rude_level = int(settings.get("rudeness_level", 1) or 0)
+        streak = self._rude_streak.get(chat_id, 0) + len(burst)
+        rude_note = ""
+        if rude_level > 0:
+            tiers = RUDENESS_INSTRUCTIONS.get(rude_level, {})
+            thresholds = sorted(tiers.keys())
+            for threshold in thresholds:
+                if streak >= threshold:
+                    rude_note = tiers[threshold]
         system = self._system_prompt(prompts["base_prompt"], style)
         kb_text = await self._db.get_full_kb(user_id)
         if kb_text:
@@ -480,6 +523,12 @@ class Userbot:
                 kb_text = kb_text[:KB_MAX_CHARS] + "…"
             system += (
                 f"\n\n{'=' * 12} {KB_SECTION_HEADER} {'=' * 12}\n{kb_text}\n{'=' * 12}"
+            )
+        if rude_note:
+            system += (
+                f"\n\n{'=' * 12} НАСТРІЙ ПОВЕДІНКИ ЗАРАЗ {'=' * 12}\n"
+                f"Співрозмовник написав {streak} повідомлень підряд без твоєї відповіді.\n"
+                f"{rude_note}\n{'=' * 12}"
             )
         latest = "\n".join(f"• {item}" for item in burst)
         current_time = datetime.now().strftime("%H:%M")

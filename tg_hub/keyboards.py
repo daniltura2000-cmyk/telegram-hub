@@ -265,10 +265,12 @@ def autoreply_menu(
     max_chunks: int,
     context_messages: int,
     cooldown_seconds: int,
+    rudeness_level: int = 1,
 ) -> InlineKeyboardMarkup:
     on_off = texts.STATE_ON if auto_reply else texts.STATE_OFF
     mode = texts.MODE_WHITELIST if whitelist_mode else texts.MODE_ALL_EXCEPT
     mention = texts.STATE_ON if only_mention else texts.STATE_OFF
+    rude = texts.RUDENESS_NAMES.get(rudeness_level, texts.RUDENESS_NAMES[1])
     rows = [
         [InlineKeyboardButton(text=texts.BTN_TOGGLE_AUTOREPLY.format(state=on_off), callback_data="ar:toggle")],
         [InlineKeyboardButton(text=texts.BTN_TOGGLE_MODE.format(mode=mode), callback_data="ar:mode")],
@@ -288,8 +290,21 @@ def autoreply_menu(
             InlineKeyboardButton(text=texts.BTN_CONTEXT_COUNT.format(value=context_messages), callback_data="ar:context"),
         ],
         [InlineKeyboardButton(text=texts.BTN_COOLDOWN.format(value=cooldown_seconds), callback_data="ar:cooldown")],
+        [InlineKeyboardButton(text=texts.BTN_RUDENESS.format(mode=rude), callback_data="ar:rudeness")],
         *back_button_row(),
     ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def rudeness_menu(current: int) -> InlineKeyboardMarkup:
+    """Вибір рівня грубості: поточний позначено ✅."""
+    rows = []
+    for level, name in texts.RUDENESS_NAMES.items():
+        mark = "✅" if level == current else "·"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {name}", callback_data=f"ar:rude:{level}",
+        )])
+    rows.extend(back_button_row("nav:autoreply"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

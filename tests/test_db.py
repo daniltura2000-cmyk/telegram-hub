@@ -328,3 +328,21 @@ async def test_chat_profile_roundtrip(db):
     assert len(await db.list_chat_profiles(1)) == 1
     # видалення неіснуючого — тихо, без помилок
     await db.delete_chat_profile(1, "-100300")
+
+
+def test_rudeness_level_default_and_update(db):
+    import asyncio
+    async def run():
+        s = await db.get_settings(1)
+        assert s["rudeness_level"] == 1
+        await db.update_settings(1, rudeness_level=3)
+        assert (await db.get_settings(1))["rudeness_level"] == 3
+    asyncio.run(run())
+
+
+def test_rudeness_instructions_structure():
+    from tg_hub.userbot import RUDENESS_INSTRUCTIONS
+    assert set(RUDENESS_INSTRUCTIONS) == {1, 2, 3}
+    for lvl, tiers in RUDENESS_INSTRUCTIONS.items():
+        assert all(isinstance(k, int) and k >= 3 for k in tiers)
+        assert all(len(v) > 30 for v in tiers.values())

@@ -128,6 +128,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "max_chunks": 3,
     "last_error": None,
     "profile_name": "",
+    "rudeness_level": 1,  # 0=вимк, 1=м'яко, 2=нормально, 3=жорстко
 }
 
 _JSON_SETTINGS_FIELDS = frozenset({"whitelist_chats", "ignore_list"})
@@ -176,6 +177,10 @@ class Database:
         if "profile_name" not in columns:
             conn.execute(
                 "ALTER TABLE settings ADD COLUMN profile_name TEXT NOT NULL DEFAULT ''"
+            )
+        if "rudeness_level" not in columns:
+            conn.execute(
+                "ALTER TABLE settings ADD COLUMN rudeness_level INTEGER NOT NULL DEFAULT 1"
             )
         # Старі дефолти reply_delay 3.0-10.0 с давали надто велику затримку відповіді:
         # рядки, які досі на старих дефолтах (власник їх не змінював), тягнемо до нових.

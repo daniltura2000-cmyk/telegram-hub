@@ -1425,6 +1425,27 @@ class ControlBot:
             )
             await cb.answer()
 
+        @r.callback_query(F.data == "ar:rudeness")
+        @error_guard
+        async def ar_rudeness(cb: CallbackQuery) -> None:
+            await self._rudeness_menu(cb)
+            await cb.answer()
+
+        @r.callback_query(F.data.startswith("ar:rude:"))
+        @error_guard
+        async def ar_rude_set(cb: CallbackQuery) -> None:
+            try:
+                level = int(cb.data.rsplit(":", 1)[1])
+            except (IndexError, ValueError):
+                await cb.answer()
+                return
+            if level not in texts.RUDENESS_NAMES:
+                await cb.answer()
+                return
+            await self._db.update_settings(cb.from_user.id, rudeness_level=level)
+            await self._rudeness_menu(cb)
+            await cb.answer(f"Грубість: {texts.RUDENESS_NAMES[level]}")
+
         @r.message(NotMenuText(), NumberStates.waiting)
         @error_guard
         async def number_input(message: Message, state: FSMContext) -> None:
@@ -1671,7 +1692,21 @@ class ControlBot:
             max_chunks=int(s["max_chunks"]),
             context_messages=int(s["context_messages"]),
             cooldown_seconds=int(s["cooldown_seconds"]),
+            rudeness_level=int(s.get("rudeness_level", 1) or 0),
         )
+
+    async def _rudeness_menu(self, cb: CallbackQuery) -> None:
+        """Показати меню вибору рівня грубості."""
+        s = await self._db.get_settings(cb.from_user.id)
+        level = int(s.get("rudeness_level", 1) or 0)
+        try:
+            await cb.message.edit_text(  # type: ignore[union-attr]
+                texts.RUDENESS_MENU, reply_markup=kb.rudeness_menu(level),
+            )
+        except TelegramAPIError:
+            await cb.message.answer(  # type: ignore[union-attr]
+                texts.RUDENESS_MENU, reply_markup=kb.rudeness_menu(level),
+            )
 
     async def _autoreply_payload(self, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         """Текст і клавіатура розділу «Налаштування авто-відповідей»."""
