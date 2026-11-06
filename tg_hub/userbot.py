@@ -508,6 +508,24 @@ class Userbot:
         )
         reply = await llm.chat([{"role": "user", "content": user_content}], system=system)
         elapsed = time.perf_counter() - started
+        logger.info("LLM raw reply: %d симв., перші 80: %r", len(reply or ""), (reply or "")[:80])
+        if not (reply or "").strip():
+            # reasoning-моделі (GLM/DeepSeek-R1 тощо) з малим max_tokens
+            # витрачають увесь бюджет на «думання» і повертають порожній
+            # content (finish_reason=length). Повтор з великим бюджетом.
+            logger.warning("LLM повернула порожню відповідь — повтор з max_tokens=1024")
+            llm_retry = create_client(
+                provider=key["provider"],
+                base_url=key["base_url"],
+                api_key=key["api_key"],
+                model=key["model"],
+                timeout=self._config.llm_timeout,
+                max_tokens=1024,
+            )
+            reply = await llm_retry.chat(
+                [{"role": "user", "content": user_content}], system=system,
+            )
+            logger.info("Повторна відповідь: %d симв.", len(reply or ""))
         logger.info(
             "LLM відповідь згенеровано за %.2fs (чат %s, контекст %d симв., "
             "KB %d симв., burst %d повід.)",

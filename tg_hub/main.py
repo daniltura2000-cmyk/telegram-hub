@@ -44,9 +44,24 @@ def _make_reminder_sender(bot: Bot):
     return send
 
 
+async def _task_watchdog() -> None:
+    """Кожні 10с логує живі asyncio-таски зі стеками — діагностика зависань."""
+    import traceback as _tb
+    while True:
+        await asyncio.sleep(10)
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()
+                 and not t.get_name().startswith(("aiogram", "telethon"))]
+        if tasks:
+            for t in tasks[:6]:
+                frames = _tb.format_stack(t.get_coro().cr_frame) if t.get_coro().cr_frame else []
+                last = frames[-1].strip() if frames else "?"
+                logger.info("WATCHDOG таск %s: %s", t.get_name(), last)
+
+
 async def run() -> None:
     config: Config = load_config()
     setup_logging(config.log_level, config.logs_dir)
+    watchdog_task = asyncio.create_task(_task_watchdog())
     logger.info("Запуск TelegramHub…")
 
     db = Database(config.database_path)

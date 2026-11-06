@@ -15,7 +15,16 @@ def build_openai_payload(model: str, messages: list[dict[str, str]], system: str
     if system:
         payload_messages.append({"role": "system", "content": system})
     payload_messages.extend(messages)
-    return {"model": model, "messages": payload_messages, "max_tokens": max_tokens}
+    payload: dict[str, Any] = {
+        "model": model, "messages": payload_messages, "max_tokens": max_tokens,
+    }
+    # Reasoning-моделі (GLM тощо): вимикаємо приховане «думання» через
+    # reasoning_effort=none — інакше воно з'їдає весь max_tokens і
+    # content приходить порожнім (finish_reason=length)
+    lower = model.lower()
+    if "glm" in lower:
+        payload["reasoning_effort"] = "none"
+    return payload
 
 
 def parse_openai_response(data: dict[str, Any]) -> str:
