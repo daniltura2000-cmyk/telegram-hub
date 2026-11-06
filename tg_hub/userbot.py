@@ -253,8 +253,13 @@ class Userbot:
             user_id = self._owner_user_id
             settings = await self._db.get_settings(user_id)
             if not settings["auto_reply"]:
+                logger.debug("Вхідне %s пропущено: автовідповіді вимкнено", message.chat_id)
                 return
             if not await self._passes_filters(message, settings):
+                logger.info(
+                    "Вхідне з %s пропущено фільтрами (вайтлист: %s, режим: %s)",
+                    message.chat_id, settings["whitelist_chats"], settings["whitelist_mode"],
+                )
                 return
 
             # текст або зрозумілий плейсхолдер для медіа (стікер/фото/голосове…)
@@ -264,13 +269,27 @@ class Userbot:
 
             chat_id = message.chat_id
             self._pending.setdefault(chat_id, []).append(text)
-            # нове повідомлення скидає таймер тиші: попередню задачу — скасувати
+            logger.info(
+                "Вхідне від %s у чат %s (%d у черзі)", message.sender_id,
+                chat_id, len(self._pending[chat_id]),
+            )
             old_task = self._debounce_tasks.get(chat_id)
             if old_task is not None and not old_task.done():
-                old_task.cancel()
+                # скасовуємо ЛИШЕ поки задача ще чекає тиші (debounce-фаза):
+                # якщо вона вже генерує/відправляє — НЕ чіпаємо, інакше
+                # втрачали і згенеровану відповідь, і burst (головний баг
+                # «бот мовчить»: ланцюг взаємних скасувань при швидких повідомленнях)
+                if not old_task.generating:
+                    old_task.cancel()
+                    logger.info("Скасовано debounce-фазу попередньої задачі (чат %s)", chat_id)
+                else:
+                    logger.info("Задача вже генерує відповідь — повідомлення стане в чергу")
             self._debounce_tasks[chat_id] = asyncio.create_task(
                 self._debounced_reply(chat_id, user_id, settings),
             )
+            # прапорець фази: True = задача вже минула debounce і генерує/шифле
+            task = self._debounce_tasks[chat_id]
+            task.generating = False  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001 — не даємо обробнику впасти
             await self._record_error(getattr(message, "chat_id", 0), f"{type(exc).__name__}: {exc}")
 
@@ -308,6 +327,9 @@ class Userbot:
 
             burst = self._pending.pop(chat_id, [])
             self._debounce_tasks.pop(chat_id, None)
+            task = asyncio.current_task()
+            if task is not None:
+                task.generating = True  # type: ignore[attr-defined]
             if not burst:
                 return
             if not settings["auto_reply"]:
@@ -319,6 +341,7 @@ class Userbot:
             if not reply:
                 return
             await self._humanized_send(chat_id, reply, settings)
+            logger.info("Відповідь надіслано в чат %s (%d чанків)", chat_id, len(reply))
             # кулдаун стартує лише після УСПІШНОГО надсилання: якщо send_message
             # впав — наступне повідомлення не блокується «порожнім» кулдауном
             self._cooldowns[chat_id] = time.monotonic()
@@ -327,6 +350,7 @@ class Userbot:
         except LLMError as exc:
             await self._record_error(chat_id, f"LLM: {exc}")
         except asyncio.CancelledError:
+            logger.warning("Debounce скасовано в debounce-фазі (чат %s)", chat_id)
             raise
         except Exception as exc:  # noqa: BLE001
             await self._record_error(chat_id, f"{type(exc).__name__}: {exc}")
@@ -494,6 +518,7 @@ class Userbot:
     # --- «людське» надсилання ---
 
     async def _humanized_send(self, chat_id: int, reply: str, settings: dict[str, Any]) -> None:
+        logger.info("ENTER _humanized_send чат %s, reply %d симв.", chat_id, len(reply))
         assert self.client is not None
         reply = strip_markdown_artifacts(reply)
         chunks = split_reply(reply, max_chunks=max(1, int(settings.get("max_chunks", 3))))
@@ -502,19 +527,32 @@ class Userbot:
         if delay_max < delay_min:
             delay_min, delay_max = delay_max, delay_min
 
+        logger.info("Відправка: %d чанк(ів), пауза %.1fс", len(chunks), delay_max)
         await asyncio.sleep(random.uniform(delay_min, delay_max))  # noqa: S311 — імітація людини
+        logger.info("Пауза відпрацювала, починаю чанки")
 
         for chunk in chunks:
             typing_seconds = min(
                 TYPING_MAX_SECONDS,
                 max(TYPING_MIN_SECONDS, len(chunk) / TYPING_CHARS_PER_SECOND),
             )
+            # chat_action — fire-and-forget із таймаутом: раніше саме тут
+            # могло зависнути надсилання (await без таймауту перед send_message)
             try:
-                await self.client.send_chat_action(chat_id, "typing")
+                await asyncio.wait_for(
+                    self.client.send_chat_action(chat_id, "typing"), timeout=5.0,
+                )
             except Exception:  # noqa: BLE001 — chat_action не критичний
-                logger.debug("send_chat_action не вдався", exc_info=True)
+                logger.debug("send_chat_action не вдався/затягнувся", exc_info=True)
             await asyncio.sleep(typing_seconds)
-            await self.client.send_message(chat_id, chunk)
+            try:
+                await asyncio.wait_for(
+                    self.client.send_message(chat_id, chunk), timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error("send_message в чат %s не відповідав 30с — скасовано", chat_id)
+                raise
+            logger.info("Чанк надіслано в %s (%d симв.)", chat_id, len(chunk))
             # між частинами додаткової паузи немає: імітація друку (typing_seconds)
             # вже дає людський ритм, а зайві 0.8-2.5 с тільки збільшували латентність
 
