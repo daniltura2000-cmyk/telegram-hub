@@ -197,8 +197,16 @@ def style_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=texts.BTN_STYLE_REGEN, callback_data="style:regen"),
         ],
         [InlineKeyboardButton(text=texts.BTN_CHAT_PROFILE, callback_data="style:perchat")],
+        [InlineKeyboardButton(text=texts.BTN_MEDIA_ARSENAL, callback_data="style:media")],
         *back_button_row(),
     ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def media_arsenal_menu() -> InlineKeyboardMarkup:
+    """Меню «Арсенал медіа»: очистити + назад до аналізу стилю."""
+    rows = [[InlineKeyboardButton(text=texts.BTN_MEDIA_CLEAR, callback_data="style:media_clear")]]
+    rows.extend(back_button_row("nav:style"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

@@ -15,6 +15,7 @@ from telethon.tl import types as tl_types
 from .config import Config
 from .db import Database
 from .llm import BaseLLMClient, LLMError, create_client
+from .persona.analyzer import classify_outgoing_media
 from .persona.styles import DEFAULT_BASE_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,52 @@ MEDIA_PLACEHOLDERS: tuple[tuple[str, str], ...] = (
 )
 
 KB_SECTION_HEADER = "БАЗА ЗНАНЬ (правила поведінки, факти про мене)"
+
+# --- медіа-манера: маркер [sticker 123_456] / [gif 123_456] у кінці відповіді ---
+MEDIA_MARKER_RE = re.compile(r"\[(sticker|gif)\s+(\d+[_:]\d+)\]\s*$")
+MEDIA_KIND_LABELS = {"sticker": "стікер", "gif": "гіфка"}
+MEDIA_ARSENAL_HEADER = "МІЙ МЕДІА-АРСЕНАЛ (стікери/гіфки, які я реально використовую в цьому чаті):"
+MEDIA_ARSENAL_INSTRUCTIONS = (
+    "Якщо в моєму стилі природно відповісти стікером або гіфкою (реакція на "
+    "жарт, підтвердження, емоція), додай У САМОМУ КІНЦІ відповіді окремим "
+    "рядком маркер: [sticker 123456_789] або [gif 123456_789] — максимум "
+    "один медіа на відповідь, тільки з арсеналу вище, лише коли органічно "
+    "(не частіше ніж у ~30 відсотків відповідей)."
+)
+
+
+def extract_media_marker(text: str) -> tuple[str, tuple[str, str] | None]:
+    """Відокремити КІНЦЕВИЙ маркер [sticker NNN_MMM] / [gif NNN_MMM] від тексту.
+
+    Повертає (текст_без_маркера, (kind, file_ref) | None).
+    """
+    match = MEDIA_MARKER_RE.search(text)
+    if match is None:
+        return text, None
+    clean = text[: match.start()].rstrip()
+    return clean, (match.group(1), match.group(2))
+
+
+async def send_media(client: Any, chat_id: int, kind: str, file_ref: str) -> bool:
+    """Надіслати стікер/гіфку за file_ref виду 'id_access_hash'. False — не вдалося."""
+    from telethon.tl.types import InputDocument  # локальний імпорт: не критичний шлях
+
+    match = re.fullmatch(r"(\d+)[_:](\d+)", (file_ref or "").strip())
+    if match is None:
+        logger.warning("Некоректний file_ref медіа (%s): %r", kind, file_ref)
+        return False
+    try:
+        document = InputDocument(
+            id=int(match.group(1)),
+            access_hash=int(match.group(2)),
+            file_reference=b"",
+        )
+        await client.send_file(chat_id, document, force_document=False)
+        return True
+    except Exception:  # noqa: BLE001 — file_reference може застаріти тощо
+        logger.warning("Не вдалося надіслати медіа %s %s у чат %s", kind, file_ref, chat_id)
+        return False
+
 
 # Ліміти промпта: довгий контекст = довга відповідь (латентність + «розмазана» увага).
 CONTEXT_MAX_CHARS = 3000    # зібрана історія: тримаємо найСВІЖІШІ повідомлення
@@ -276,6 +323,22 @@ class Userbot:
         """Вхідне повідомлення → фільтри → черга burst → (пауза тиші) → одна відповідь."""
         message = event.message
         if message.out or getattr(message, "action", None) is not None:
+            # власник САМ відправив стікер/гіф → поповнюємо медіа-арсенал чату
+            # (шлях захисний: основний обробник слухає лише incoming)
+            if message.out and self._owner_user_id is not None:
+                media = classify_outgoing_media(message)
+                if media is not None:
+                    kind, file_ref = media
+                    try:
+                        await self._db.save_media_usage(
+                            self._owner_user_id, str(message.chat_id), kind, file_ref,
+                        )
+                        logger.info(
+                            "Арсенал: власник надіслав %s %s (чат %s)",
+                            kind, file_ref, message.chat_id,
+                        )
+                    except Exception:  # noqa: BLE001 — арсенал не ламає обробник
+                        logger.exception("Не вдалося зберегти медіа в арсенал")
             return
         if self._owner_user_id is None or message.sender_id == self._owner_user_id:
             return
@@ -371,7 +434,17 @@ class Userbot:
             reply = await self._generate_reply(user_id, settings, chat_id, burst)
             if not reply:
                 return
+            # медіа-манера: кінцевий маркер [sticker/gif NNN_MMM] → медіа окремим повідомленням
+            reply, media = extract_media_marker(reply)
             await self._humanized_send(chat_id, reply, settings)
+            if media:
+                kind, file_ref = media
+                assert self.client is not None
+                if await send_media(self.client, chat_id, kind, file_ref):
+                    logger.info("Медіа надіслано в чат %s: %s %s", chat_id, kind, file_ref)
+                else:
+                    logger.info("Медіа НЕ надіслано (чат %s, %s %s) — лишився тільки текст",
+                                chat_id, kind, file_ref)
             logger.info("Відповідь надіслано в чат %s (%d чанків)", chat_id, len(reply))
             # кулдаун стартує лише після УСПІШНОГО надсилання: якщо send_message
             # впав — наступне повідомлення не блокується «порожнім» кулдауном
@@ -560,6 +633,18 @@ class Userbot:
             "Напиши МОЮ відповідь (лише текст повідомлення, без лапок і пояснень). "
             "Одна відповідь на весь блок, не окремо на кожне повідомлення."
         )
+        # медіа-манера: арсенал стікерів/гіфок цього чату (якщо є)
+        arsenal = await self._db.list_media_arsenal(user_id, str(chat_id))
+        if arsenal:
+            arsenal_lines = "\n".join(
+                f"{MEDIA_KIND_LABELS.get(item['kind'], item['kind'])} "
+                f"{item['file_ref']} (вживав {item['usage_count']} раз(ів))"
+                for item in arsenal
+            )
+            user_content += (
+                f"\n\n{MEDIA_ARSENAL_HEADER}\n{arsenal_lines}\n\n"
+                f"{MEDIA_ARSENAL_INSTRUCTIONS}"
+            )
         if next_prompt:
             # одноразовий директив власника для ЦІЄЇ відповіді: вищий пріоритет
             # за стиль і правила (але персона/рід не ламаються)

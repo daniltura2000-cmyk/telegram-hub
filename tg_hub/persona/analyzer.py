@@ -92,6 +92,77 @@ async def collect_dialogue_pairs(
     return pairs
 
 
+async def collect_media_usage(
+    client: _TelethonLike,
+    chat_ref: Any,
+    limit: int = DEFAULT_MESSAGES_PER_CHAT,
+) -> list[tuple[str, str]]:
+    """Зібрати МЕДІА-арсенал власника з чату: (kind, file_ref).
+
+    kind — 'sticker' або 'gif'; file_ref — дверниковий формат
+    ``id_access_hash`` (без лапок і дужок). Беруться ТІЛЬКИ власні
+    вихідні повідомлення (message.out). Порядок — як у iter_messages.
+    """
+    entity = await client.get_entity(chat_ref)
+    usage: list[tuple[str, str]] = []
+    async for message in client.iter_messages(entity, limit=limit):
+        media = classify_outgoing_media(message)
+        if media is not None:
+            usage.append(media)
+    return usage
+
+
+def _document_file_ref(doc: Any) -> str | None:
+    """file_ref виду '123456_789' з Document, або None якщо id/hash відсутні."""
+    file_id = getattr(doc, "id", None)
+    access_hash = getattr(doc, "access_hash", None)
+    if file_id is None or access_hash is None:
+        return None
+    try:
+        return f"{int(file_id)}_{int(access_hash)}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _document_mime(doc: Any) -> str:
+    """mime_type документа: з атрибута або з DocumentAttribute* (фейк-об'єкти)."""
+    mime = (getattr(doc, "mime_type", None) or "").strip()
+    if mime:
+        return mime
+    for attr in (getattr(doc, "attributes", None) or []):
+        candidate = getattr(attr, "mime_type", None)
+        if candidate:
+            return str(candidate)
+    return ""
+
+
+def classify_outgoing_media(message: Any) -> tuple[str, str] | None:
+    """('sticker'|'gif', file_ref) для ВЛАСНОГО медіа-повідомлення, або None.
+
+    Текстові повідомлення, чужі медіа та інші файли ігноруються.
+    """
+    if not getattr(message, "out", False):
+        return None
+    # стікер: Telethon дає message.sticker → Document стікера
+    doc = getattr(message, "sticker", None)
+    if doc is not None:
+        ref = _document_file_ref(doc)
+        if ref:
+            return ("sticker", ref)
+    # гіфка: message.gif або document з mime image/gif
+    doc = getattr(message, "gif", None)
+    if doc is not None:
+        ref = _document_file_ref(doc)
+        if ref:
+            return ("gif", ref)
+    doc = getattr(message, "document", None)
+    if doc is not None and _document_mime(doc) == "image/gif":
+        ref = _document_file_ref(doc)
+        if ref:
+            return ("gif", ref)
+    return None
+
+
 async def collect_outgoing_messages(
     client: _TelethonLike,
     chat_ref: Any,

@@ -156,6 +156,9 @@ class _FakeDB:
     async def get_full_kb(self, user_id):  # noqa: ANN001
         return "ФАКТ-ЗАПИС " * 500  # 5500 символів — має обрізатися до KB_MAX_CHARS
 
+    async def list_media_arsenal(self, user_id, chat_ref=None):  # noqa: ANN001
+        return []  # без арсеналу — блок медіа-манери не додається
+
 
 @pytest.mark.asyncio
 async def test_generate_reply_structure_kb_cap_and_timing_log(

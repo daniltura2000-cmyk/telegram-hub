@@ -108,6 +108,16 @@ CREATE TABLE IF NOT EXISTS chat_profiles (
     PRIMARY KEY (user_id, chat_ref)
 );
 
+CREATE TABLE IF NOT EXISTS media_arsenal (
+    user_id      INTEGER NOT NULL,
+    chat_ref     TEXT    NOT NULL,
+    kind         TEXT    NOT NULL CHECK(kind IN ('sticker','gif')),
+    file_ref     TEXT    NOT NULL,
+    usage_count  INTEGER NOT NULL DEFAULT 1,
+    last_used_at TEXT,
+    PRIMARY KEY (user_id, chat_ref, file_ref)
+);
+
 CREATE INDEX IF NOT EXISTS idx_llm_keys_user   ON llm_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_qa_journal_user ON qa_journal(user_id, id);
 CREATE INDEX IF NOT EXISTS idx_reminders_due   ON reminders(done, due_at);
@@ -364,6 +374,61 @@ class Database:
                     (user_id, chat_ref),
                 )
         await self._run(_del)
+
+    # --- арсенал медіа (стікери/гіфки, які власник реально використовує) ---
+
+    def _save_media_usage_sync(self, user_id: int, chat_ref: str,
+                               kind: str, file_ref: str) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            self._ensure_user_sync(user_id)
+            conn.execute(
+                "INSERT INTO media_arsenal(user_id, chat_ref, kind, file_ref, "
+                "usage_count, last_used_at) VALUES (?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(user_id, chat_ref, file_ref) DO UPDATE SET "
+                "usage_count = usage_count + 1, last_used_at = excluded.last_used_at",
+                (user_id, chat_ref, kind, file_ref, now),
+            )
+
+    async def save_media_usage(self, user_id: int, chat_ref: str,
+                               kind: str, file_ref: str) -> None:
+        """UPSERT: перший раз — usage_count=1, повторно — usage_count+1."""
+        await self._run(self._save_media_usage_sync, user_id, chat_ref, kind, file_ref)
+
+    def _list_media_arsenal_sync(self, user_id: int,
+                                 chat_ref: str | None) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if chat_ref is None:
+                rows = conn.execute(
+                    "SELECT * FROM media_arsenal WHERE user_id = ? "
+                    "ORDER BY usage_count DESC, last_used_at DESC",
+                    (user_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM media_arsenal WHERE user_id = ? AND chat_ref = ? "
+                    "ORDER BY usage_count DESC, last_used_at DESC",
+                    (user_id, chat_ref),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def list_media_arsenal(self, user_id: int,
+                                 chat_ref: str | None = None) -> list[dict[str, Any]]:
+        """Арсенал чату (або всіх чатів, якщо chat_ref=None)."""
+        return await self._run(self._list_media_arsenal_sync, user_id, chat_ref)
+
+    def _clear_media_arsenal_sync(self, user_id: int, chat_ref: str | None) -> None:
+        with self._connect() as conn:
+            if chat_ref is None:
+                conn.execute("DELETE FROM media_arsenal WHERE user_id = ?", (user_id,))
+            else:
+                conn.execute(
+                    "DELETE FROM media_arsenal WHERE user_id = ? AND chat_ref = ?",
+                    (user_id, chat_ref),
+                )
+
+    async def clear_media_arsenal(self, user_id: int, chat_ref: str | None = None) -> None:
+        await self._run(self._clear_media_arsenal_sync, user_id, chat_ref)
 
     # --- налаштування ---
 

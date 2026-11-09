@@ -38,7 +38,7 @@ from .db import Database
 from .llm import create_client
 from .llm.probe import ProbeError, probe_key, verify_model
 from .persona import DEFAULT_BASE_PROMPT, generate_style_profile
-from .persona.analyzer import generate_chat_profile
+from .persona.analyzer import collect_media_usage, generate_chat_profile
 from .reminders import format_due, parse_reminder_time, serialize_snapshot
 from .userbot import Userbot
 
@@ -276,7 +276,29 @@ class ControlBot:
         await self._db.set_style_profile(user_id, profile)
         for ref in resolved_refs:
             await self._db.mark_analyzed(user_id, ref)
+        await self._collect_media_arsenal(user_id, resolved_refs)
         await status_msg.answer(texts.ANALYSIS_DONE, reply_markup=kb.style_menu())
+
+    async def _collect_media_arsenal(self, user_id: int, refs: list[str]) -> None:
+        """Зібрати медіа-арсенал власника (стікери/гіфки) з обраних чатів.
+
+        Окремі чати, де збір не вдався, просто пропускаються.
+        """
+        client = self._userbot.client
+        if client is None:
+            return
+        for ref in refs:
+            try:
+                entity = await self._resolve_chat_ref(ref)
+                usage = await collect_media_usage(
+                    client, entity, limit=self._config.analysis_limit,
+                )
+            except Exception:  # noqa: BLE001 — медіа не критичні для профілю стилю
+                logger.warning("Не вдалося зібрати медіа-арсенал з %s", ref, exc_info=True)
+                continue
+            for kind, file_ref in usage:
+                await self._db.save_media_usage(user_id, ref, kind, file_ref)
+            logger.info("Арсенал медіа зібрано: %d записів (чат %s)", len(usage), ref)
 
     # ------------------------------------------------------------------ головне меню
 
@@ -925,6 +947,38 @@ class ControlBot:
             await cb.message.answer(texts.ANALYSIS_STARTED.format(limit=self._config.analysis_limit))  # type: ignore[union-attr]
             await self._run_style_analysis(cb.from_user.id, refs, cb.message)  # type: ignore[arg-type]
 
+        # ------------------------------------------------------ арсенал медіа
+
+        @r.callback_query(F.data == "style:media")
+        @error_guard
+        async def media_arsenal(cb: CallbackQuery) -> None:
+            rows = await self._db.list_media_arsenal(cb.from_user.id)
+            if rows:
+                per: dict[str, dict[str, int]] = {}
+                for row in rows:
+                    counts = per.setdefault(row["chat_ref"], {"sticker": 0, "gif": 0})
+                    counts[row["kind"]] = counts.get(row["kind"], 0) + 1
+                items = "\n".join(
+                    texts.MEDIA_ARSENAL_ITEM.format(
+                        chat_ref=ref, stickers=counts["sticker"], gifs=counts["gif"],
+                    )
+                    for ref, counts in sorted(per.items())
+                )
+                text = texts.MEDIA_ARSENAL_MENU.format(items=items)
+            else:
+                text = texts.MEDIA_ARSENAL_EMPTY
+            await self._safe_edit(cb.message, text, kb.media_arsenal_menu())  # type: ignore[arg-type]
+            await cb.answer()
+
+        @r.callback_query(F.data == "style:media_clear")
+        @error_guard
+        async def media_arsenal_clear(cb: CallbackQuery) -> None:
+            await self._db.clear_media_arsenal(cb.from_user.id)
+            await cb.answer(texts.MEDIA_ARSENAL_CLEARED, show_alert=True)
+            await self._safe_edit(  # type: ignore[arg-type]
+                cb.message, texts.MEDIA_ARSENAL_EMPTY, kb.media_arsenal_menu(),
+            )
+
         # ------------------------------------------------------ пер-чат профілі
 
         @r.callback_query(F.data == "style:perchat")
@@ -976,6 +1030,7 @@ class ControlBot:
                     limit=self._config.analysis_limit,
                 )
                 await self._db.save_chat_profile(cb.from_user.id, ref, profile)
+                await self._collect_media_arsenal(cb.from_user.id, [ref])
                 title = ref
                 try:
                     entity = await self._resolve_chat_ref(ref)
